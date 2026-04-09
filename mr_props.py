@@ -11,7 +11,7 @@ import scipy.constants as const
 ############################################################################################################
 # Averages
 ############################################################################################################
-def ensemble_average_from_rdf(r, p_r, rdf, V=1.0, cumulative=False):
+def ensemble_average_from_rdf(r, p_r, rdf, V=1.0, cumulative=False, N_other_atoms=None):
     """
     Calculates the ensemble average of the weighted property values, normalized by the
     system volume. Optionally returns the running cumulative integral.
@@ -22,6 +22,7 @@ def ensemble_average_from_rdf(r, p_r, rdf, V=1.0, cumulative=False):
     - rdf: Radial distribution function values at the corresponding distances (same length as r).
     - V: Volume of the system (default is 1.0 for normalization).
     - cumulative: If True, also return the cumulative integral as a function of distance.
+    - N_other_atoms: Number of other atoms to scale the result by (optional).
 
     Returns:
     - Asymptotic ensemble average value.
@@ -32,6 +33,10 @@ def ensemble_average_from_rdf(r, p_r, rdf, V=1.0, cumulative=False):
 
     # Compute the total (asymptotic) average normalized by volume
     asymptotic = np.trapz(integrand, r) / V
+    
+    # Scale by N_other_atoms if provided
+    if N_other_atoms is not None:
+        asymptotic *= N_other_atoms
 
     if not cumulative:
         return asymptotic
@@ -43,10 +48,14 @@ def ensemble_average_from_rdf(r, p_r, rdf, V=1.0, cumulative=False):
     
     # Normalize cumulative integral by volume
     cumulative_average = cumulative_integral / V
+    
+    # Scale by N_other_atoms if provided
+    if N_other_atoms is not None:
+        cumulative_average *= N_other_atoms
 
     return asymptotic, cumulative_average
 
-def coordination_number_from_rdf(r, rdf, V=1.0, cumulative=False):
+def coordination_number_from_rdf(r, rdf, V=1.0, cumulative=False, N_other_atoms=None):
     """
     Calculates the coordination number by integrating the RDF.
 
@@ -55,6 +64,8 @@ def coordination_number_from_rdf(r, rdf, V=1.0, cumulative=False):
     - rdf: Radial distribution function values at the corresponding distances (same length as r).
     - V: Volume of the system (default is 1.0 for normalization).
     - cumulative: If True, also return the cumulative coordination number.
+    - N_other_atoms: Number of other atoms to which the RDF was calculated. If provided, 
+        the coordination number will be scaled by this number.
 
     Returns:
     - Asymptotic coordination number.
@@ -62,7 +73,9 @@ def coordination_number_from_rdf(r, rdf, V=1.0, cumulative=False):
     """
     # Coordination number is the integral of the RDF (property is unity)
     p_r = np.ones_like(r)
-    return ensemble_average_from_rdf(r, p_r, rdf, V, cumulative=cumulative)
+    return ensemble_average_from_rdf(r, p_r, rdf, V, 
+                                     cumulative=cumulative, 
+                                     N_other_atoms=N_other_atoms)
 
 def first_order_virial_coefficient(r, p_r, V_r, T):
     """
