@@ -2,6 +2,8 @@
 MD trajectory analysis tool for gas phase MD simulations.
 """
 
+# TODO: OMP parallelization, thread number control (to 1) 
+
 ###########################################################################################################
 # Imports
 ###########################################################################################################
@@ -494,9 +496,13 @@ def categorize_collisions(processed_collisions,
         Each key maps to a dictionary where:
         - Keys are atom indices from group1.
         - Values are lists of pandas DataFrames representing the categorized collisions.
+        Every processed collision event is assigned to one of these
+        categories, including short partner-specific events with no
+        detected local minimum.
     """
     # Define the vdW classification threshold as ±0.75 Å around the bond length
-    vdw_bond_threshold = (vdw_bond_length - 0.75, vdw_bond_length + 0.75)
+    # vdw_bond_threshold = (vdw_bond_length - 0.75, vdw_bond_length + 0.75)
+    vdw_bond_threshold = (vdw_bond_length - 1.0, vdw_bond_length + 1.0) # NOTE
 
     # Helper function to process collisions for a single atom
     def process_atom(atom_index, collisions):
@@ -539,7 +545,8 @@ def categorize_collisions(processed_collisions,
             # If 75% or more of the distances fall within the threshold range
             # and the event lifetime is longer than 10 ps,
             # automatically classify the collision as a van der Waals (vdw) event
-            if percentage_within_threshold >= 0.75 and lifetime_ps > 10.0:
+            # if percentage_within_threshold >= 0.75 and lifetime_ps > 10.0:
+            if percentage_within_threshold >= 0.7 and lifetime_ps > 10.0: # NOTE
                 categorized['vdw'].append(collision_df)
                 continue  # Skip further categorization for this collision
 
@@ -554,10 +561,13 @@ def categorize_collisions(processed_collisions,
             num_minima = len(minima_indices)
 
             # Count the number of local minima that are below the vdW bond length + 0.75 Å
-            num_minima_below_vdw = np.sum(main_atom_distances[minima_indices] < (vdw_bond_length + 0.75))
+            # num_minima_below_vdw = np.sum(main_atom_distances[minima_indices] < (vdw_bond_length + 0.75))
+            num_minima_below_vdw = np.sum(main_atom_distances[minima_indices] < (vdw_bond_length + 1.0)) # NOTE
 
-            # Categorize the collision based on its properties
-            if num_minima == 1:
+            # Categorize the collision based on its properties.
+            # Partner-specific processing can yield short events with no
+            # resolved local minimum, but these must still be retained.
+            if num_minima <= 1:
                 if is_multi_body:
                     categorized['multi_body_scattering'].append(collision_df)
                 else:
@@ -740,6 +750,8 @@ def collision_statistics(categorized_events,
         A dictionary with the same structure as categorized_events, where each category maps to a dictionary
         with atom indices as keys and lists of dictionaries as values. Each dictionary in the list contains
         statistics for each event:
+                - 'event_index': The index of the event within the list of events
+                    for that atom in the category.
         - 'lifetime_ps': The lifetime of the event in picoseconds.
         - 'num_atoms_involved': The number of unique atoms involved in the event (including the atom itself).
         - 'avg_num_atoms': The average number of atoms present per frame during the event.
@@ -765,8 +777,10 @@ def collision_statistics(categorized_events,
             # Initialize list to store statistics for this atom
             collision_stats[category][atom_index] = []
 
-            # Process each event for the current atom
-            for event_df in categorized_events[category][atom_index]:
+            # Process each event for the current atom.
+            for event_index, event_df in enumerate(
+                categorized_events[category][atom_index]
+            ):
 
                 # Calculate the lifetime of the event in picoseconds
                 event_duration = event_df['frame'].max() - event_df['frame'].min() + 1
@@ -785,6 +799,7 @@ def collision_statistics(categorized_events,
                 
                 # Append the statistics for the current event to the atom's list
                 collision_stats[category][atom_index].append({
+                    'event_index': event_index,
                     'lifetime_ps': lifetime,
                     'num_atoms_involved': num_atoms_involved,
                     'avg_num_atoms': avg_num_atoms
@@ -1759,30 +1774,68 @@ def save_collision_event_trajectories(u,
 # Miscellaneous helper functions
 ###############################################################################################################
 def sort_collision_statistics(collision_stats, 
-                              property_name):
+                              property_name,
+                              atomwise=True,
+                              reverse=True):
     """
     Sort collision statistics by a given property.
 
     Inputs:
     - collision_stats: dict
-        A dictionary with the same keys as categorized_events, where each value is a list of dictionaries
-        containing statistics for each event.
+        A dictionary with the same keys as categorized_events, where each
+        category value is a dictionary with atom indices as keys and lists
+        of dictionaries containing statistics for each event as values.
     - property_name: str
         The name of the property to sort by (e.g., 'lifetime_ps').
+    - atomwise: bool
+        If True (default), sort the event statistics separately for each
+        atom within each category and preserve the nested dictionary
+        structure. If False, combine the events of all atoms within each
+        category into one list, sort that list, and store the source atom
+        index for each event under the key 'atom_index'.
+    - reverse: bool
+        If True (default), sort in descending order. If False, sort in
+        ascending order.
 
     Returns:
     - sorted_stats: dict
-        A dictionary with the same keys as collision_stats, where each value is a list of dictionaries
+        If atomwise is True, a dictionary with the same nested structure as
+        collision_stats, where the list of event statistics for each atom is
         sorted by the specified property in descending order.
+        If atomwise is False, a dictionary keyed by category, where each
+        value is a sorted list of event-statistics dictionaries collected
+        from all atoms in that category. Each event dictionary then also
+        contains the corresponding atom index under the key 'atom_index'.
     """
     sorted_stats = {}
     
-    # Sort each category independently by the requested property
-    for category, stats in collision_stats.items():
-        sorted_stats[category] = sorted(
-            stats,
-            key=lambda x: x[property_name],  # Extract the value used for sorting
-            reverse=True                     # Largest values first
-        )
+    # Sort each category either atomwise or across all atoms.
+    for category, atoms_dict in collision_stats.items():
+        if atomwise:
+            sorted_stats[category] = {}
+
+            # Sort the event list for each atom by the requested property.
+            for atom_index, stats_list in atoms_dict.items():
+                sorted_stats[category][atom_index] = sorted(
+                    stats_list,
+                    key=lambda x: x[property_name],
+                    reverse=reverse
+                )
+        else:
+            combined_stats = []
+
+            # Collect all event statistics for the category into one list.
+            for atom_index, stats_list in atoms_dict.items():
+                for event_stats in stats_list:
+                    event_stats_with_atom = dict(event_stats)
+                    event_stats_with_atom['atom_index'] = atom_index
+                    combined_stats.append(event_stats_with_atom)
+
+            # Sort the combined event list across all atoms.
+            sorted_stats[category] = sorted(
+                combined_stats,
+                key=lambda x: x[property_name],
+                reverse=reverse
+            )
 
     return sorted_stats
