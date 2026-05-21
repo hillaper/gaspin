@@ -501,8 +501,8 @@ def categorize_collisions(processed_collisions,
         detected local minimum.
     """
     # Define the vdW classification threshold as ±0.75 Å around the bond length
-    # vdw_bond_threshold = (vdw_bond_length - 0.75, vdw_bond_length + 0.75)
-    vdw_bond_threshold = (vdw_bond_length - 1.0, vdw_bond_length + 1.0) # NOTE
+    vdw_bond_threshold = (vdw_bond_length - 0.75, vdw_bond_length + 0.75)
+    # vdw_bond_threshold = (vdw_bond_length - 1.0, vdw_bond_length + 1.0) # NOTE
 
     # Helper function to process collisions for a single atom
     def process_atom(atom_index, collisions):
@@ -545,8 +545,8 @@ def categorize_collisions(processed_collisions,
             # If 75% or more of the distances fall within the threshold range
             # and the event lifetime is longer than 10 ps,
             # automatically classify the collision as a van der Waals (vdw) event
-            # if percentage_within_threshold >= 0.75 and lifetime_ps > 10.0:
-            if percentage_within_threshold >= 0.7 and lifetime_ps > 10.0: # NOTE
+            if percentage_within_threshold >= 0.75 and lifetime_ps > 10.0:
+            # if percentage_within_threshold >= 0.7 and lifetime_ps > 10.0: # NOTE
                 categorized['vdw'].append(collision_df)
                 continue  # Skip further categorization for this collision
 
@@ -561,8 +561,8 @@ def categorize_collisions(processed_collisions,
             num_minima = len(minima_indices)
 
             # Count the number of local minima that are below the vdW bond length + 0.75 Å
-            # num_minima_below_vdw = np.sum(main_atom_distances[minima_indices] < (vdw_bond_length + 0.75))
-            num_minima_below_vdw = np.sum(main_atom_distances[minima_indices] < (vdw_bond_length + 1.0)) # NOTE
+            num_minima_below_vdw = np.sum(main_atom_distances[minima_indices] < (vdw_bond_length + 0.75))
+            # num_minima_below_vdw = np.sum(main_atom_distances[minima_indices] < (vdw_bond_length + 1.0)) # NOTE
 
             # Categorize the collision based on its properties.
             # Partner-specific processing can yield short events with no
@@ -972,7 +972,8 @@ def cluster_formation_equilibrium_values(cluster_counts,
     return equilibrium_constants, equilibrium_fractions
 
 def cluster_formation_rates(cluster_counts, 
-                            dt):
+                            dt,
+                            volume=None):
     """
     Compute cluster formation and break-up rates from cluster counts over time.
 
@@ -982,14 +983,21 @@ def cluster_formation_rates(cluster_counts,
         Each element in the array represents the number of clusters at that frame for the corresponding category.
     - dt: float
         The time step between frames in seconds.
+    - volume: float, optional
+        The system volume in cubic Ångströms. If provided, rates are normalized by volume
+        and returned in units of 1/(s*cm^3). Default is None.
 
     Returns:
     - rates: dict
         A dictionary with the same keys as cluster_counts, where each value is a dictionary containing:
-        - 'formation_rate': The average rate of cluster formation (clusters per second).
-        - 'breakup_rate': The average rate of cluster break-up (clusters per second).
+        - 'formation_rate': The average rate of cluster formation (clusters per second, or 1/(s*cm^3) if volume is provided).
+        - 'breakup_rate': The average rate of cluster break-up (clusters per second, or 1/(s*cm^3) if volume is provided).
     """
     rates = {}
+    
+    # Conversion factor from Ångströms^3 to cm^3
+    angstrom_to_cm = 1e-8
+    volume_cm3 = volume * (angstrom_to_cm ** 3) if volume is not None else None
     
     for category, counts in cluster_counts.items():
         # Calculate the difference in cluster counts between consecutive frames
@@ -1005,6 +1013,11 @@ def cluster_formation_rates(cluster_counts,
         # Calculate rates
         formation_rate = formations / total_time if total_time > 0 else 0
         breakup_rate = breakups / total_time if total_time > 0 else 0
+        
+        # Normalize by volume if provided
+        if volume_cm3 is not None:
+            formation_rate /= volume_cm3
+            breakup_rate /= volume_cm3
         
         rates[category] = {
             'formation_rate': formation_rate,
