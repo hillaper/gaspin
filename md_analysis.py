@@ -77,18 +77,16 @@ def rdf(group1,
     """
     # Create an RDF object and run the analysis
     if group1 == group2:
-        rdf_analysis = InterRDF(
-                        group1, 
-                        group2, 
-                        exclusion_block=(1, 1),  # Exclude self-pairs for the same group
-                        range=range,
-                        nbins=nbins)
+        rdf_analysis = InterRDF(group1,
+                                group2,
+                                exclusion_block=(1, 1),  # Exclude self-pairs for the same group
+                                range=range,
+                                nbins=nbins)
     else:
-        rdf_analysis = InterRDF(
-                        group1, 
-                        group2, 
-                        range=range, 
-                        nbins=nbins)
+        rdf_analysis = InterRDF(group1,
+                                group2,
+                                range=range,
+                                nbins=nbins)
     rdf_analysis.run()
 
     return rdf_analysis.results.bins, rdf_analysis.results.rdf
@@ -217,11 +215,10 @@ def find_collisions(u,
                     frame_entry['distances'].append(dists[i, j])
                 else:
                     # Create a new entry for the current frame with atom2 and distance
-                    new_entry = {
-                        'frame': ts.frame,
-                        'atoms2': [group2.indices[j]],
-                        'distances': [dists[i, j]]
-                    }
+                    new_entry = {'frame': ts.frame,
+                                 'atoms2': [group2.indices[j]],
+                                 'distances': [dists[i, j]]}
+                    
                     collisions[group1.indices[i]].append(new_entry)
                     frame_dict[group1.indices[i]][ts.frame] = new_entry
     
@@ -375,11 +372,9 @@ def process_collisions_partner_specific(collisions,
             reordered_atoms2.append(atom2)
             reordered_distances.append(distances2[i])
 
-        return {
-            'frame': collision['frame'],
-            'atoms2': reordered_atoms2,
-            'distances': reordered_distances
-        }
+        return {'frame': collision['frame'],
+                'atoms2': reordered_atoms2,
+                'distances': reordered_distances}
     
     # Process collisions independently for each atom from group1.
     for atom_index in tqdm(collisions, desc='Processing collisions'):
@@ -414,39 +409,27 @@ def process_collisions_partner_specific(collisions,
             for partner_atom in list(active_events):
                 previous_frame = active_events[partner_atom]['previous_frame']
                 if frame - previous_frame > 1 or partner_atom not in current_partners:
-                    event_records.append(
-                        (
-                            active_events[partner_atom]['start_frame'],
-                            partner_atom,
-                            active_events[partner_atom]['rows']
-                        )
-                    )
+                    event_records.append((active_events[partner_atom]['start_frame'],
+                                          partner_atom,
+                                          active_events[partner_atom]['rows']))
                     del active_events[partner_atom]
 
             # Update or start an event for every partner present in this frame.
             for partner_atom in current_partners:
                 if partner_atom not in active_events:
-                    active_events[partner_atom] = {
-                        'rows': [],
-                        'previous_frame': frame,
-                        'start_frame': frame
-                    }
+                    active_events[partner_atom] = {'rows': [],
+                                                   'previous_frame': frame,
+                                                   'start_frame': frame}
 
                 # Append a reordered frame entry where this partner is first.
-                active_events[partner_atom]['rows'].append(
-                    collision_for_partner(collision, partner_atom)
-                )
+                active_events[partner_atom]['rows'].append(collision_for_partner(collision, partner_atom))
                 active_events[partner_atom]['previous_frame'] = frame
 
         # Finalize any events still active after the last frame.
         for partner_atom, event_data in active_events.items():
-            event_records.append(
-                (
-                    event_data['start_frame'],
-                    partner_atom,
-                    event_data['rows']
-                )
-            )
+            event_records.append((event_data['start_frame'],
+                                  partner_atom,
+                                  event_data['rows']))
 
         # Sort events deterministically by start frame and partner index,
         # then convert each event to a DataFrame.
@@ -460,11 +443,16 @@ def categorize_collisions(processed_collisions,
                           cutoff,
                           dt,
                           vdw_bond_length,
-                          distance_minima_prominence=0.25, 
+                          distance_minima_prominence=0.25,
                           n_jobs=-1,
-                          allowed_atom_indices=None):
+                          allowed_atom_indices=None,
+                          vdw_well_occupancy=0.75):
     """
     Categorize collisions into different categories based on collision properties.
+
+    The classification uses the local minima of the distance series of the main colliding pair, the
+    fraction of the event that the pair spends in the potential well, and the number of atoms involved.
+    It involves no lifetime criterion.
 
     Inputs:
     - processed_collisions: dict
@@ -489,6 +477,12 @@ def categorize_collisions(processed_collisions,
         Number of CPUs for parallel processing. Default is -1 (use all available).
     - allowed_atom_indices: list of int, optional
         If provided, only collisions where at least one allowed atom index appears in atoms2 are considered.
+    - vdw_well_occupancy: float or None
+        An event is classified directly as vdW when at least this fraction of its main-pair distances lies
+        within ±0.75 Å of vdw_bond_length. This captures bound pairs on nearly circular orbits, whose radial
+        oscillations are too shallow to be resolved as distance minima. Default is 0.75. None disables the
+        criterion. For gas-phase Xe, all events that meet the criterion last longer than 50 ps, so it
+        reproduces the earlier rule that additionally required a lifetime above 10 ps.
 
     Returns:
     - categorized_collisions: dict
@@ -502,7 +496,6 @@ def categorize_collisions(processed_collisions,
     """
     # Define the vdW classification threshold as ±0.75 Å around the bond length
     vdw_bond_threshold = (vdw_bond_length - 0.75, vdw_bond_length + 0.75)
-    # vdw_bond_threshold = (vdw_bond_length - 1.0, vdw_bond_length + 1.0) # NOTE
 
     # Helper function to process collisions for a single atom
     def process_atom(atom_index, collisions):
@@ -532,30 +525,23 @@ def categorize_collisions(processed_collisions,
             main_atom_distances = main_partner_distance_series(collision_df, 
                                                                allowed_atom_indices=allowed_atom_indices)
             
-            # Calculate event lifetime in picoseconds
-            lifetime_ps = (collision_df['frame'].max() - collision_df['frame'].min() + 1) * dt * 1e12
-            
-            # Count how many distances fall within the vdW threshold range
-            within_threshold = np.sum((main_atom_distances >= vdw_bond_threshold[0]) & 
-                                     (main_atom_distances <= vdw_bond_threshold[1]))
-            
-            # Calculate the percentage of distances within the threshold
-            percentage_within_threshold = within_threshold / len(main_atom_distances)
-            
-            # If 75% or more of the distances fall within the threshold range
-            # and the event lifetime is longer than 10 ps,
-            # automatically classify the collision as a van der Waals (vdw) event
-            if percentage_within_threshold >= 0.75 and lifetime_ps > 10.0:
-            # if percentage_within_threshold >= 0.7 and lifetime_ps > 10.0: # NOTE
-                categorized['vdw'].append(collision_df)
-                continue  # Skip further categorization for this collision
+            # Classify events in which the pair stays in the potential well for most of the time directly as vdW
+            if vdw_well_occupancy is not None:
+
+                # Calculate the fraction of distances within the vdW threshold range
+                within_threshold = np.sum((main_atom_distances >= vdw_bond_threshold[0]) &
+                                          (main_atom_distances <= vdw_bond_threshold[1]))
+                fraction_within_threshold = within_threshold / len(main_atom_distances)
+
+                # Classify as vdW if the fraction reaches the well-occupancy threshold
+                if fraction_within_threshold >= vdw_well_occupancy:
+                    categorized['vdw'].append(collision_df)
+                    continue
 
             # Find the indices of local minima in the negated and shifted distance series
             shifted_neg_distances = -main_atom_distances + cutoff  # shift to start from zero
-            minima_indices, _ = find_peaks(
-                shifted_neg_distances, 
-                prominence=distance_minima_prominence
-            )
+            minima_indices, _ = find_peaks(shifted_neg_distances,
+                                           prominence=distance_minima_prominence)
             
             # Count the number of local minima
             num_minima = len(minima_indices)
@@ -581,10 +567,9 @@ def categorize_collisions(processed_collisions,
         return atom_index, categorized
 
     # Parallel processing of collisions for all atoms
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(process_atom)(atom_index, collisions)
-        for atom_index, collisions in tqdm(processed_collisions.items(), desc='Categorizing collisions')
-    )
+    results = Parallel(n_jobs=n_jobs)(delayed(process_atom)(atom_index, collisions)
+                                      for atom_index, collisions in tqdm(processed_collisions.items(), 
+                                                                         desc='Categorizing collisions'))
 
     # Combine results from all atoms into the final categorized collisions dictionary
     categorized_collisions = {'two_body_scattering': {}, 
@@ -651,8 +636,8 @@ def main_partner_distance_series(collision,
     """
     Extract the distance series for the main colliding partner in a collision.
 
-    The main partner is defined as the atom from group2 that has the smallest
-    average distance to the atom from group1 over the entire collision event.
+    The main partner is defined as the atom from group2 that is present in the most frames
+    of the collision event (see main_partner_index()).
     If allowed_atom_indices is provided, only those atoms are considered as potential main partners.
 
     Inputs:
@@ -750,22 +735,42 @@ def collision_statistics(categorized_events,
         A dictionary with the same structure as categorized_events, where each category maps to a dictionary
         with atom indices as keys and lists of dictionaries as values. Each dictionary in the list contains
         statistics for each event:
-                - 'event_index': The index of the event within the list of events
-                    for that atom in the category.
+        - 'event_index': The index of the event within the list of events
+            for that atom in the category.
         - 'lifetime_ps': The lifetime of the event in picoseconds.
         - 'num_atoms_involved': The number of unique atoms involved in the event (including the atom itself).
         - 'avg_num_atoms': The average number of atoms present per frame during the event.
+        - 'avg_main_partner_distance': The average distance in Angstroms
+          between the reference atom and the main colliding partner during
+          the event.
     - cluster_counts: dict
         A dictionary with the same keys as categorized_events, where each value is an array of length total_frames.
-        Each element in the array represents the number of clusters at that frame for the corresponding category.
+        Each element in the array represents the number of connected atom clusters at that frame for the corresponding category.
     """
+    # Merge one set of cluster atoms into the list of frame-local connected
+    # clusters, combining any overlapping atom sets into a single component.
+    def merge_frame_cluster(frame_clusters, cluster_atoms):
+        merged_cluster = set(cluster_atoms)
+        remaining_clusters = []
+
+        for existing_cluster in frame_clusters:
+            if merged_cluster.intersection(existing_cluster):
+                merged_cluster.update(existing_cluster)
+            else:
+                remaining_clusters.append(existing_cluster)
+
+        remaining_clusters.append(merged_cluster)
+
+        return remaining_clusters
+
     # Initialize a dictionary to store statistics for each category and atom index
     collision_stats = {category: {} for category in categorized_events}
     
     # Initialize a dictionary to store cluster counts for each category
     cluster_counts = {category: np.zeros(total_frames, dtype=int) for category in categorized_events}
     
-    # Create a dictionary to track unique clusters per frame for each category
+    # Create a dictionary to track connected clusters per frame for each
+    # category.
     cluster_set = {category: {} for category in categorized_events}
 
     # Iterate over each category in the categorized events
@@ -778,9 +783,7 @@ def collision_statistics(categorized_events,
             collision_stats[category][atom_index] = []
 
             # Process each event for the current atom.
-            for event_index, event_df in enumerate(
-                categorized_events[category][atom_index]
-            ):
+            for event_index, event_df in enumerate(categorized_events[category][atom_index]):
 
                 # Calculate the lifetime of the event in picoseconds
                 event_duration = event_df['frame'].max() - event_df['frame'].min() + 1
@@ -796,30 +799,37 @@ def collision_statistics(categorized_events,
                 num_frames = len(event_df)
                 total_atoms_per_frame = sum(len(atoms2_list) + 1 for atoms2_list in event_df['atoms2'])
                 avg_num_atoms = total_atoms_per_frame / num_frames if num_frames > 0 else 0
+
+                # Calculate the average distance to the main colliding partner.
+                main_partner_distances = main_partner_distance_series(event_df)
+                if np.all(np.isnan(main_partner_distances)):
+                    avg_main_partner_distance = np.nan
+                else:
+                    avg_main_partner_distance = np.nanmean(main_partner_distances)
                 
                 # Append the statistics for the current event to the atom's list
-                collision_stats[category][atom_index].append({
-                    'event_index': event_index,
-                    'lifetime_ps': lifetime,
-                    'num_atoms_involved': num_atoms_involved,
-                    'avg_num_atoms': avg_num_atoms
-                })
+                collision_stats[category][atom_index].append({'event_index': event_index,
+                                                              'lifetime_ps': lifetime,
+                                                              'num_atoms_involved': num_atoms_involved,
+                                                              'avg_num_atoms': avg_num_atoms,
+                                                              'avg_main_partner_distance': avg_main_partner_distance})
                 
-                # Extract cluster counts over time
-                main_partner_idx = main_partner_index(event_df)
-
-                # Iterate over each row in the event DataFrame to track clusters
+                # Iterate over each row in the event DataFrame to track
+                # connected clusters over time.
                 for row in event_df.itertuples():
                     frame = row.frame
 
-                    # Create a unique identifier for the cluster (main atom index, partner index)
-                    # NOTE: (A, B) is currently considered same as (B, A)
-                    cluster_id = tuple(sorted((atom_index, main_partner_idx))) 
-                    
-                    # Use a set to avoid double counting the same cluster in the same frame
+                    # Build the atom set present in this event row.
+                    cluster_atoms = set([atom_index] + list(row.atoms2))
+
+                    # Merge this atom set into the connected clusters already
+                    # seen for the same frame.
                     if frame not in cluster_set[category]:
-                        cluster_set[category][frame] = set()
-                    cluster_set[category][frame].add(cluster_id)
+                        cluster_set[category][frame] = []
+                    cluster_set[category][frame] = merge_frame_cluster(
+                        cluster_set[category][frame],
+                        cluster_atoms
+                    )
 
     # Count unique clusters per frame for each category
     for category, clusters in cluster_set.items():
@@ -828,6 +838,80 @@ def collision_statistics(categorized_events,
 
     # Return the dictionary containing collision statistics and cluster counts
     return collision_stats, cluster_counts
+
+def combine_collision_statistics(collision_statistics_results):
+    """
+    Combine multiple outputs of collision_statistics() in chronological order.
+
+    Inputs:
+    - collision_statistics_results: tuple-like
+        Iterable of tuples returned by collision_statistics(). Each tuple must
+        contain:
+        - collision_stats: dict
+            Nested dictionary of per-event statistics.
+        - cluster_counts: dict
+            Dictionary of per-frame cluster-count arrays.
+        The first tuple is used as the structural reference. All following
+        tuples are assumed to continue the trajectory in chronological order.
+
+    Returns:
+    - combined_collision_stats: dict
+        Combined collision statistics with the same nested structure as one
+        collision_statistics() output. Event indices are reassigned so that
+        they remain consecutive within each atom and category after merging.
+    - combined_cluster_counts: dict
+        Dictionary of concatenated cluster-count arrays for each category.
+    """
+    # Require at least one result tuple to define the reference structure.
+    if not collision_statistics_results:
+        raise ValueError('collision_statistics_results must contain at least one result.')
+
+    # Use the first result as the structural reference for categories and atoms.
+    reference_collision_stats, reference_cluster_counts = collision_statistics_results[0]
+
+    # Initialize the combined statistics by copying the reference structure.
+    combined_collision_stats = {}
+    for category, atoms_dict in reference_collision_stats.items():
+        combined_collision_stats[category] = {}
+        for atom_index, stats_list in atoms_dict.items():
+            combined_collision_stats[category][atom_index] = [dict(event_stats)
+                                                              for event_stats in stats_list]
+
+    # Initialize concatenated cluster counts from the reference arrays.
+    combined_cluster_counts = {category: np.array(counts, copy=True)
+                               for category, counts in reference_cluster_counts.items()}
+
+    # Append all following result tuples in chronological order.
+    for collision_stats, cluster_counts in collision_statistics_results[1:]:
+
+        # Extend the event statistics for each category and include any new
+        # atom keys that appear only in later trajectory pieces.
+        for category, next_atoms_dict in collision_stats.items():
+            if category not in combined_collision_stats:
+                raise ValueError(f"Missing collision_stats category '{category}' in reference result.")
+
+            for atom_index, next_stats_list in next_atoms_dict.items():
+                if atom_index not in combined_collision_stats[category]:
+                    combined_collision_stats[category][atom_index] = []
+
+                combined_stats_list = combined_collision_stats[category][atom_index]
+                next_event_index = len(combined_stats_list)
+
+                for event_stats in next_stats_list:
+                    merged_event_stats = dict(event_stats)
+                    merged_event_stats['event_index'] = next_event_index
+                    combined_stats_list.append(merged_event_stats)
+                    next_event_index += 1
+
+        # Concatenate the per-category cluster-count time series.
+        for category, combined_counts in combined_cluster_counts.items():
+            next_counts = cluster_counts.get(category)
+            if next_counts is None:
+                raise ValueError(f"Missing cluster_counts category '{category}' in merged result.")
+            combined_cluster_counts[category] = np.concatenate((combined_counts,
+                                                                next_counts))
+
+    return combined_collision_stats, combined_cluster_counts
 
 def collision_counts(collision_stats):
     """
@@ -919,17 +1003,13 @@ def cluster_formation_equilibrium_values(cluster_counts,
     # from the collision statistics.
     avg_cluster_sizes = {}
     for category in cluster_counts:
-        category_event_stats = [
-            event_stat
-            for atom_stats in collision_stats.get(category, {}).values()
-            for event_stat in atom_stats
-        ]
+        category_event_stats = [event_stat
+                                for atom_stats in collision_stats.get(category, {}).values()
+                                for event_stat in atom_stats]
 
         if category_event_stats:
-            avg_cluster_sizes[category] = np.mean([
-                event_stat['avg_num_atoms']
-                for event_stat in category_event_stats
-            ])
+            avg_cluster_sizes[category] = np.mean([event_stat['avg_num_atoms']
+                                                   for event_stat in category_event_stats])
         else:
             avg_cluster_sizes[category] = 0.0
     
@@ -1019,12 +1099,52 @@ def cluster_formation_rates(cluster_counts,
             formation_rate /= volume_cm3
             breakup_rate /= volume_cm3
         
-        rates[category] = {
-            'formation_rate': formation_rate,
-            'breakup_rate': breakup_rate
-        }
-    
+        rates[category] = {'formation_rate': formation_rate,
+                           'breakup_rate': breakup_rate}
+
     return rates
+
+def atom_time_fractions(collision_stats,
+                        n_atoms,
+                        total_frames,
+                        dt):
+    """
+    Calculate the fraction of the total atom-time spent as a reference atom in events of each category.
+
+    Each frame of a reference atom belongs to at most one of its events, so these fractions and the
+    remaining fraction of free atoms sum to unity. Together with time-weighted category averages
+    (see average_property_R_time_weighted()), they decompose the trajectory average of a single-atom
+    property exactly: <A> = sum_c f_c <A_c>.
+
+    Inputs:
+    - collision_stats: dict
+        Output of collision_statistics() or combine_collision_statistics(). The field 'lifetime_ps'
+        of each event is used.
+    - n_atoms: int
+        Number of reference atoms.
+    - total_frames: int
+        Total number of frames in the trajectory.
+    - dt: float
+        Time step between frames in seconds.
+
+    Returns:
+    - time_fractions: dict
+        A dictionary with the same category keys as collision_stats, plus the key 'free_monomers',
+        where each value is the fraction of the total atom-time.
+    """
+    # Total atom-time of the trajectory in picoseconds
+    total_atom_time_ps = n_atoms * total_frames * dt * 1e12
+
+    # Sum the event lifetimes of each category and normalise by the total atom-time
+    time_fractions = {}
+    for category, atoms_dict in collision_stats.items():
+        category_time_ps = sum(event['lifetime_ps'] for stats_list in atoms_dict.values() for event in stats_list)
+        time_fractions[category] = category_time_ps / total_atom_time_ps
+
+    # The remaining atom-time is spent outside any event
+    time_fractions['free_monomers'] = 1.0 - sum(time_fractions.values())
+
+    return time_fractions
 
 ##############################################################################################################
 # Trajectory analysis functions using categorized events
@@ -1188,7 +1308,6 @@ def property_R_all_partners_time_series(categorized_collisions,
 
 def average_property_R_per_event(categorized_collisions,
                                  property_function,
-                                 dt,
                                  *args,
                                  use_pairwise_sum=False):
     """
@@ -1207,9 +1326,6 @@ def average_property_R_per_event(categorized_collisions,
         A function that takes a distance array R and additional arguments to
         calculate the desired property. The property must depend only on the
         distance R between atoms.
-    - dt: float
-        The time step between frames in seconds. This is used to convert
-        event lengths to lifetimes in picoseconds.
     - *args: additional arguments to be passed to the property_function.
     - use_pairwise_sum: bool
         If True, uses pairwise sum of all partners. If False (default), uses
@@ -1222,16 +1338,11 @@ def average_property_R_per_event(categorized_collisions,
         containing:
         - 'average_property': The average value of the property over all
           distances R in that collision event.
-        - 'lifetime_ps': The lifetime of the event in picoseconds.
     """
     # Initialise a nested dictionary to match the categorized collision
     # structure.
-    event_average_properties = {
-        category: {
-            atom_index: [] for atom_index in categorized_collisions[category]
-        }
-        for category in categorized_collisions
-    }
+    event_average_properties = {category: {atom_index: [] for atom_index in categorized_collisions[category]}
+                                for category in categorized_collisions}
 
     # Process one category at a time using the same tqdm pattern as the other
     # analysis functions.
@@ -1239,125 +1350,55 @@ def average_property_R_per_event(categorized_collisions,
 
         # Process each atom in the current category with a category-specific
         # progress bar.
-        for atom_index in tqdm(
-            categorized_collisions[category],
-            desc=f'Calculating average collision properties for {category}'
-        ):
+        for atom_index in tqdm(categorized_collisions[category],
+                               desc=f'Calculating average collision properties for {category}'):
 
             # Iterate through each collision event for the current atom.
-            for event_index, event_df in enumerate(
-                categorized_collisions[category][atom_index]
-            ):
+            for event_index, _ in enumerate(categorized_collisions[category][atom_index]):
 
                 # Select the distance series definition requested by the user.
                 if use_pairwise_sum:
-                    _, property_values = property_R_all_partners_time_series(
-                        categorized_collisions,
-                        category,
-                        atom_index,
-                        event_index,
-                        property_function,
-                        *args,
-                        use_pairwise_sum=True
-                    )
+                    _, property_values = property_R_all_partners_time_series(categorized_collisions,
+                                                                             category,
+                                                                             atom_index,
+                                                                             event_index,
+                                                                             property_function,
+                                                                             *args,
+                                                                             use_pairwise_sum=True)
                 else:
-                    property_values = property_R_main_partner_time_series(
-                        categorized_collisions,
-                        category,
-                        atom_index,
-                        event_index,
-                        property_function,
-                        *args
-                    )
+                    property_values = property_R_main_partner_time_series(categorized_collisions,
+                                                                          category,
+                                                                          atom_index,
+                                                                          event_index,
+                                                                          property_function,
+                                                                          *args)
 
                 # Compute the event-averaged property value.
                 average_value = np.nanmean(property_values)
 
-                # Convert the event duration from frames to picoseconds.
-                event_duration = (
-                    event_df['frame'].max() - event_df['frame'].min() + 1
-                )
-                lifetime_ps = event_duration * dt * 1e12
-
                 # Store the per-event result in the nested output structure.
-                event_average_properties[category][atom_index].append({
-                    'average_property': average_value,
-                    'lifetime_ps': lifetime_ps
-                })
+                event_average_properties[category][atom_index].append({'average_property': average_value})
 
     return event_average_properties
 
-def average_property_R_further(event_average_properties,
-                               dt,
-                               total_frames,
-                               average_over_events=True,
-                               average_over_atoms=False):
+def average_property_R_over_events(event_average_properties):
     """
-    Further process per-event property averages over events and,
-    optionally, over atoms.
+    Average per-event property values over events for each atom.
 
     Inputs:
     - event_average_properties: dict
         Output of average_property_R_per_event(). The dictionary is keyed by
         category and atom index, and each value is a list of per-event result
         dictionaries.
-    - dt: float
-        The time step between frames in seconds.
-    - total_frames: int
-        The total number of frames in the trajectory. Together with dt, this
-        is used to calculate the total trajectory length in picoseconds.
-    - average_over_events: bool
-        If True (default), return summaries over the events of each
-        atom. If False, return the input event_average_properties unchanged.
-    - average_over_atoms: bool
-        If True, also average over atoms within each category. This option
-        requires average_over_events=True, so averaging only over atoms is
-        not allowed.
 
     Returns:
-    - average_properties: dict
-        If average_over_events=False, the return value is the input
-        event_average_properties.
-        If average_over_events=True, each category value is a dictionary where
-        each atom index maps to a dictionary containing:
+        - average_properties: dict
+                Each category value is a dictionary where each atom index maps to a dictionary containing:
         - 'average_property': The average property over all events of that
           atom in the category.
-        - 'average_lifetime_ps': The average event lifetime in picoseconds for
-          that atom in the category.
-        - 'total_lifetime_ps': The total lifetime in picoseconds spent by that
-          atom in the category.
-        - 'fraction_of_trajectory': The fraction of the full trajectory time
-          that the atom spends in that category.
         - 'total_num_events': The total number of events for that atom in the
           category.
-                If average_over_events=True and average_over_atoms=True, each
-                category value is a category-level summary averaged over all atoms
-                with recorded events in that category.
     """
-    # Reject invalid trajectory definitions because the time fraction is
-    # normalised by the total trajectory length derived from these values.
-    if dt <= 0:
-        raise ValueError('dt must be a positive number.')
-
-    if total_frames <= 0:
-        raise ValueError('total_frames must be a positive integer.')
-
-    # Calculate the total trajectory length in picoseconds from dt and the
-    # total number of frames.
-    total_trajectory_length_ps = total_frames * dt * 1e12
-
-    # Reject inconsistent averaging settings because averaging over atoms
-    # requires the per-atom event averages to be available first.
-    if average_over_atoms and not average_over_events:
-        raise ValueError(
-            'average_over_atoms requires average_over_events=True.'
-        )
-
-    # Return the per-event results unchanged if no event summarising is
-    # requested.
-    if not average_over_events:
-        return event_average_properties
-
     # Build one event-level summary per atom within each category.
     average_properties = {}
     for category, atoms_dict in event_average_properties.items():
@@ -1366,78 +1407,52 @@ def average_property_R_further(event_average_properties,
         # Summarise the event averages for each atom separately.
         for atom_index, atom_events in atoms_dict.items():
             if atom_events:
-                lifetimes = [event['lifetime_ps'] for event in atom_events]
-                total_lifetime_ps = np.sum(lifetimes)
-                average_properties[category][atom_index] = {
-                    'average_property': np.mean([
-                        event['average_property'] for event in atom_events
-                    ]),
-                    'average_lifetime_ps': np.mean(lifetimes),
-                    'total_lifetime_ps': total_lifetime_ps,
-                    'fraction_of_trajectory': (
-                        total_lifetime_ps / total_trajectory_length_ps
-                    ),
-                    'total_num_events': len(atom_events)
-                }
+                average_property_values = [event['average_property'] for event in atom_events]
+                average_properties[category][atom_index] = {'average_property': np.mean(average_property_values),
+                                                            'total_num_events': len(atom_events)}
             else:
-                average_properties[category][atom_index] = {
-                    'average_property': np.nan,
-                    'average_lifetime_ps': np.nan,
-                    'total_lifetime_ps': 0.0,
-                    'fraction_of_trajectory': 0.0,
-                    'total_num_events': 0
-                }
+                average_properties[category][atom_index] = {'average_property': np.nan,
+                                                            'total_num_events': 0}
 
-        # Optionally also build a category-level summary over all atoms.
-        if average_over_atoms:
-            atom_summaries = [
-                summary
-                for summary in average_properties[category].values()
-                if summary['total_num_events'] > 0
-            ]
+    return average_properties
 
-            if atom_summaries:
-                category_summary = {
-                    'average_property': np.mean([
-                        summary['average_property']
-                        for summary in atom_summaries
-                    ]),
-                    'average_lifetime_ps': np.mean([
-                        summary['average_lifetime_ps']
-                        for summary in atom_summaries
-                    ]),
-                    'total_lifetime_ps': np.sum([
-                        summary['total_lifetime_ps']
-                        for summary in atom_summaries
-                    ]),
-                    'fraction_of_trajectory': np.mean([
-                        summary['fraction_of_trajectory']
-                        for summary in atom_summaries
-                    ]),
-                    'total_num_events': np.sum([
-                        summary['total_num_events']
-                        for summary in atom_summaries
-                    ]),
-                    'num_atoms': len(atom_summaries)
-                }
-            else:
-                category_summary = {
-                    'average_property': np.nan,
-                    'average_lifetime_ps': np.nan,
-                    'total_lifetime_ps': 0.0,
-                    'fraction_of_trajectory': np.nan,
-                    'total_num_events': 0,
-                    'num_atoms': 0
-                }
+def average_property_R_over_atoms(average_properties_over_events):
+    """
+    Average per-atom property summaries over atoms within each category.
 
-            average_properties[category] = category_summary
+    Inputs:
+    - average_properties_over_events: dict
+        Output of average_property_R_over_events(). Each category value is a
+        dictionary keyed by atom index and each atom value contains the
+        summary fields 'average_property' and 'total_num_events'.
+
+    Returns:
+    - average_properties: dict
+        Dictionary keyed by category, where each value is a category-level
+        summary averaged over all atoms with recorded events in that
+        category.
+    """
+    average_properties = {}
+
+    for category, atoms_dict in average_properties_over_events.items():
+        atom_summaries = [summary for summary in atoms_dict.values()
+                          if summary['total_num_events'] > 0]
+
+        if atom_summaries:
+            average_property_values = [summary['average_property']
+                                       for summary in atom_summaries]
+            total_event_counts = [summary['total_num_events']
+                                  for summary in atom_summaries]
+            average_properties[category] = {'average_property': np.mean(average_property_values),
+                                            'total_num_events': np.sum(total_event_counts)}
+        else:
+            average_properties[category] = {'average_property': np.nan,
+                                            'total_num_events': 0}
 
     return average_properties
 
 def average_property_R(categorized_collisions,
                        property_function,
-                       dt,
-                       total_frames,
                        *args,
                        average_over_events=True,
                        average_over_atoms=False,
@@ -1462,12 +1477,6 @@ def average_property_R(categorized_collisions,
         A function that takes a distance array R and additional arguments to
         calculate the desired property. The property must depend only on the
         distance R between atoms.
-    - dt: float
-        The time step between frames in seconds. This is used to convert event
-        lengths to lifetimes in picoseconds.
-    - total_frames: int
-        The total number of frames in the trajectory. Together with dt, this
-        defines the total trajectory length used for time fractions.
     - *args: additional arguments to be passed to the property_function.
     - average_over_events: bool
         If True (default), returns the average property value over all events
@@ -1483,30 +1492,105 @@ def average_property_R(categorized_collisions,
 
     Returns:
     - average_properties: dict
-        The output of average_property_R_further().
+        The output of average_property_R_over_events() or, if
+        average_over_atoms=True, the output of average_property_R_over_atoms().
     """
     # Calculate the average property for each individual event first.
-    event_average_properties = average_property_R_per_event(
-        categorized_collisions,
-        property_function,
-        dt,
-        *args,
-        use_pairwise_sum=use_pairwise_sum
-    )
+    event_average_properties = average_property_R_per_event(categorized_collisions,
+                                                            property_function,
+                                                            *args,
+                                                            use_pairwise_sum=use_pairwise_sum)
 
-    # Process the per-event values further according to the requested level.
-    return average_property_R_further(
-        event_average_properties,
-        dt,
-        total_frames,
-        average_over_events=average_over_events,
-        average_over_atoms=average_over_atoms
-    )
+    # Return the per-event values unchanged when no further averaging is requested.
+    if not average_over_events:
+        return event_average_properties
 
-def weighted_average_property_R_contributions(average_properties):
+    # Average the event-level values for each atom.
+    average_properties = average_property_R_over_events(event_average_properties)
+
+    # Optionally average the atom-level summaries over atoms within a category.
+    if average_over_atoms:
+        return average_property_R_over_atoms(average_properties)
+
+    return average_properties
+
+def average_property_R_time_weighted(categorized_collisions,
+                                     property_function,
+                                     *args,
+                                     use_pairwise_sum=True,
+                                     n_jobs=1):
     """
-    Calculate the contribution of each event category to the experimentally
-    measured ensemble average.
+    Calculate the time-weighted average of a distance-dependent property for each event category.
+
+    The property values of all frames of all events in a category are pooled, so that each event
+    contributes in proportion to its lifetime. This is the category average that is consistent with
+    the atom-time fractions of atom_time_fractions(), and the two together reproduce the trajectory
+    average of the property exactly.
+
+    Inputs:
+    - categorized_collisions: dict
+        A dictionary with four keys: 'two_body_scattering', 'multi_body_scattering',
+        'perturbed_scattering', and 'vdw'. Each key maps to a dictionary where:
+        - Keys are atom indices from group1.
+        - Values are lists of pandas DataFrames representing the categorized collisions.
+    - property_function: function
+        A function that takes a distance array R and additional arguments and returns the property.
+        The property must depend only on R.
+    - *args: additional arguments to be passed to the property_function.
+    - use_pairwise_sum: bool
+        If True (default), the property of a frame is the sum over all partners within the cutoff
+        (pairwise additivity). If False, only the main partner is used.
+    - n_jobs: int
+        Number of CPUs for parallel processing over atoms. Default is 1.
+
+    Returns:
+    - average_properties: dict
+        Dictionary keyed by category, where each value contains:
+        - 'average_property': The time-weighted average property of the category.
+        - 'total_num_events': The total number of events in the category.
+        - 'total_frames': The total number of frames of all events in the category.
+        - 'property_sum': The sum of the property over all frames, for pooling several trajectories.
+    """
+    # Helper function returning the frame sum of the property and the number of frames for the events of one atom.
+    # Only the event list of the atom is passed, so that parallel workers do not receive the whole dictionary.
+    def process_atom(events):
+        property_sum = 0.0
+        num_frames = 0
+        for event_df in events:
+            if use_pairwise_sum:
+                partner_distances = distance_series(event_df)
+                property_values = [property_function(distances, *args) for distances in partner_distances.values()]
+            else:
+                property_values = property_function(main_partner_distance_series(event_df), *args)
+            property_sum += np.nansum(property_values)
+            num_frames += len(event_df)
+        return property_sum, num_frames, len(events)
+
+    average_properties = {}
+    for category in categorized_collisions:
+
+        # Pool the frame sums of all atoms in the category
+        results = Parallel(n_jobs=n_jobs)(delayed(process_atom)(events)
+                                          for events in tqdm(categorized_collisions[category].values(),
+                                                             desc=f'Time-weighted averages for {category}'))
+        property_sum = sum(result[0] for result in results)
+        total_frames = sum(result[1] for result in results)
+        total_num_events = sum(result[2] for result in results)
+
+        average_properties[category] = {'average_property': property_sum / total_frames if total_frames > 0
+                                                            else np.nan,
+                                         'total_num_events': total_num_events,
+                                         'total_frames': total_frames,
+                                         'property_sum': property_sum}
+
+    return average_properties
+
+def average_property_R_statistics(average_properties,
+                                  equilibrium_fractions,
+                                  collision_stats):
+    """
+    Calculate category-level lifetime statistics and equilibrium-weighted
+    average contributions for distance-dependent properties.
 
     This function assumes that average_property_R() was called with
     average_over_events=True and average_over_atoms=True, so that each
@@ -1516,97 +1600,198 @@ def weighted_average_property_R_contributions(average_properties):
     - average_properties: dict
         Output of average_property_R() when both average_over_events and
         average_over_atoms are True. Each category value must contain the
-        keys 'average_property' and 'fraction_of_trajectory'.
+        keys 'average_property' and 'total_num_events'.
+    - equilibrium_fractions: dict
+        Output of cluster_formation_equilibrium_values(). The category
+        fractions are used to weight the average property contributions.
+    - collision_stats: dict
+        Output of collision_statistics(). Used only to obtain event
+        lifetimes for the average lifetime statistics.
 
     Returns:
-    - weighted_contributions_df: pandas DataFrame
+    - property_statistics_df: pandas DataFrame
         A DataFrame containing one row for each event category and one final
         all row. The columns are:
         - 'category': The event category label.
         - 'average_property': The average property value for the category.
-        - 'fraction_of_trajectory': The fraction of trajectory assigned to
-          the category.
+        - 'total_num_events': The total number of events in the category.
+        - 'average_lifetime_ps': The average event lifetime in picoseconds.
+        - 'equilibrium_fraction': The equilibrium fraction assigned to the
+          category.
         - 'weighted_average': The contribution of the category to the
           ensemble average.
     """
     # Initialise a list of rows for the output table.
-    weighted_contribution_rows = []
+    property_statistics_rows = []
 
-    # Calculate one weighted contribution for each category.
+    # Calculate one set of summary statistics for each category.
     for category, category_summary in average_properties.items():
+        category_collision_stats = collision_stats.get(category, {})
+        event_lifetimes = [event['lifetime_ps']
+                           for stats_list in category_collision_stats.values()
+                           for event in stats_list]
+        equilibrium_fraction = equilibrium_fractions.get(category, np.nan)
 
-        # Validate that the expected category-level summary structure is
-        # present before attempting the calculation.
-        if not isinstance(category_summary, dict):
-            raise TypeError(
-                'Each category summary must be a dictionary when averaging '
-                'over events and atoms.'
-            )
-
-        if 'average_property' not in category_summary:
-            raise KeyError(
-                f"Category '{category}' is missing 'average_property'."
-            )
-
-        if 'fraction_of_trajectory' not in category_summary:
-            raise KeyError(
-                f"Category '{category}' is missing 'fraction_of_trajectory'."
-            )
-
-        # Weight the category-average property by the fraction of trajectory
-        # spent in that event category.
-        weighted_average = (
-            category_summary['average_property']
-            * category_summary['fraction_of_trajectory']
-        )
+        average_lifetime_ps = np.mean(event_lifetimes) if event_lifetimes else np.nan
+        weighted_average = category_summary['average_property'] * equilibrium_fraction
 
         # Store the category contribution as one row of the output table.
-        weighted_contribution_rows.append({
-            'category': category,
-            'average_property': category_summary['average_property'],
-            'fraction_of_trajectory': category_summary['fraction_of_trajectory'],
-            'weighted_average': weighted_average
-        })
+        property_statistics_rows.append({'category': category,
+                                        'average_property': category_summary['average_property'],
+                                        'total_num_events': category_summary['total_num_events'],
+                                        'average_lifetime_ps': average_lifetime_ps,
+                                        'equilibrium_fraction': equilibrium_fraction,
+                                        'weighted_average': weighted_average})
 
     # Sum the category contributions to obtain the ensemble-average
     # contribution from all event categories.
-    all_fraction_of_trajectory = np.sum([
-        row['fraction_of_trajectory'] for row in weighted_contribution_rows
-    ])
-    all_weighted_average = np.sum([
-        row['weighted_average'] for row in weighted_contribution_rows
-    ])
+    equilibrium_fraction_values = [row['equilibrium_fraction'] for row in property_statistics_rows]
+    all_equilibrium_fraction = np.sum(equilibrium_fraction_values)
+    all_weighted_average = np.sum([row['average_property'] * row['equilibrium_fraction']
+                                   for row in property_statistics_rows])
+
+    event_lifetimes = [event['lifetime_ps']
+                       for category_stats in collision_stats.values()
+                       for stats_list in category_stats.values()
+                       for event in stats_list]
+    all_average_lifetime_ps = np.mean(event_lifetimes) if event_lifetimes else np.nan
 
     # Calculate the all-category average property represented by the included
     # event categories.
-    if all_fraction_of_trajectory > 0:
-        all_average_property = (
-            all_weighted_average / all_fraction_of_trajectory
-        )
-    else:
-        all_average_property = np.nan
+    all_average_property = all_weighted_average / all_equilibrium_fraction \
+        if all_equilibrium_fraction > 0 else np.nan
 
     # Append a final row containing the all-category weighted average.
-    weighted_contribution_rows.append({
-        'category': 'all',
-        'average_property': all_average_property,
-        'fraction_of_trajectory': all_fraction_of_trajectory,
-        'weighted_average': all_weighted_average
-    })
+    property_statistics_rows.append({'category': 'all',
+                                     'average_property': all_average_property,
+                                     'total_num_events': np.sum([row['total_num_events'] for row in property_statistics_rows]),
+                                     'average_lifetime_ps': all_average_lifetime_ps,
+                                     'equilibrium_fraction': all_equilibrium_fraction,
+                                     'weighted_average': all_weighted_average})
 
     # Convert the table to a DataFrame and format the numeric columns for
     # display in scientific notation with two decimals.
-    weighted_contributions_df = pd.DataFrame(weighted_contribution_rows)
-    for column in [
-        'average_property',
-        'fraction_of_trajectory',
-        'weighted_average'
-    ]:
-        weighted_contributions_df[column] = weighted_contributions_df[column].map(
-            lambda value: f'{value:.2e}'
-        )
+    property_statistics_df = pd.DataFrame(property_statistics_rows)
+    for column in ['average_property',
+                   'average_lifetime_ps',
+                   'equilibrium_fraction',
+                   'weighted_average']:
+        # property_statistics_df[column] = property_statistics_df[column].map(lambda value: f'{value:.2e}')
+        property_statistics_df[column] = property_statistics_df[column].map(lambda value: f'{value:.3e}')
 
-    return weighted_contributions_df
+    return property_statistics_df
+
+# def average_property_R_statistics(average_properties,
+#                                   collision_stats,
+#                                   dt,
+#                                   total_frames):
+#     """
+#     Calculate category-level lifetime statistics and weighted average
+#     contributions for distance-dependent properties.
+
+#     This function assumes that average_property_R() was called with
+#     average_over_events=True and average_over_atoms=True, so that each
+#     category maps directly to a category-level summary.
+
+#     Inputs:
+#     - average_properties: dict
+#         Output of average_property_R() when both average_over_events and
+#         average_over_atoms are True. Each category value must contain the
+#         keys 'average_property' and 'total_num_events'.
+#     - collision_stats: dict
+#         Output of collision_statistics(). Used to obtain event lifetimes for
+#         the trajectory-fraction statistics.
+#     - dt: float
+#         The time step between frames in seconds.
+#     - total_frames: int
+#         The total number of frames in the trajectory.
+
+#     Returns:
+#     - property_statistics_df: pandas DataFrame
+#         A DataFrame containing one row for each event category and one final
+#         all row. The columns are:
+#         - 'category': The event category label.
+#         - 'average_property': The average property value for the category.
+#                 - 'total_num_events': The total number of events in the category.
+#         - 'average_lifetime_ps': The average event lifetime in picoseconds.
+#         - 'total_lifetime_ps': The total event lifetime in picoseconds summed
+#           over all atoms.
+#         - 'fraction_of_trajectory': The fraction of trajectory assigned to
+#           the category.
+#         - 'weighted_average': The contribution of the category to the
+#           ensemble average.
+#     """
+#     # Calculate the total trajectory length in picoseconds from dt and the
+#     # total number of frames.
+#     total_trajectory_length_ps = total_frames * dt * 1e12
+
+#     # Initialise a list of rows for the output table.
+#     property_statistics_rows = []
+
+#     # Calculate one set of summary statistics for each category.
+#     for category, category_summary in average_properties.items():
+#         category_collision_stats = collision_stats.get(category, {})
+#         atom_lifetime_totals = [np.sum([event['lifetime_ps'] for event in stats_list])
+#                                for stats_list in category_collision_stats.values()
+#                                if stats_list]
+#         event_lifetimes = [event['lifetime_ps']
+#                            for stats_list in category_collision_stats.values()
+#                            for event in stats_list]
+
+#         average_lifetime_ps = np.mean(event_lifetimes) if event_lifetimes else np.nan
+#         total_lifetime_ps = np.sum(event_lifetimes) if event_lifetimes else 0.0
+#         fraction_of_trajectory = np.mean([lifetime / total_trajectory_length_ps
+#                                           for lifetime in atom_lifetime_totals]) if atom_lifetime_totals else np.nan
+#         weighted_average = category_summary['average_property'] * fraction_of_trajectory
+
+#         # Store the category contribution as one row of the output table.
+#         property_statistics_rows.append({'category': category,
+#                                         'average_property': category_summary['average_property'],
+#                                         'total_num_events': category_summary['total_num_events'],
+#                                         'average_lifetime_ps': average_lifetime_ps,
+#                                         'total_lifetime_ps': total_lifetime_ps,
+#                                         'fraction_of_trajectory': fraction_of_trajectory,
+#                                         'weighted_average': weighted_average})
+
+#     # Sum the category contributions to obtain the ensemble-average
+#     # contribution from all event categories.
+#     trajectory_fractions = [row['fraction_of_trajectory'] for row in property_statistics_rows]
+#     weighted_averages = [row['weighted_average'] for row in property_statistics_rows]
+#     all_fraction_of_trajectory = np.sum(trajectory_fractions)
+#     all_weighted_average = np.sum(weighted_averages)
+#     all_total_lifetime_ps = np.sum([row['total_lifetime_ps'] for row in property_statistics_rows])
+
+#     event_lifetimes = [event['lifetime_ps']
+#                        for category_stats in collision_stats.values()
+#                        for stats_list in category_stats.values()
+#                        for event in stats_list]
+#     all_average_lifetime_ps = np.mean(event_lifetimes) if event_lifetimes else np.nan
+
+#     # Calculate the all-category average property represented by the included
+#     # event categories.
+#     all_average_property = all_weighted_average / all_fraction_of_trajectory \
+#         if all_fraction_of_trajectory > 0 else np.nan
+
+#     # Append a final row containing the all-category weighted average.
+#     property_statistics_rows.append({'category': 'all',
+#                                      'average_property': all_average_property,
+#                                      'total_num_events': np.sum([row['total_num_events'] for row in property_statistics_rows]),
+#                                      'average_lifetime_ps': all_average_lifetime_ps,
+#                                      'total_lifetime_ps': all_total_lifetime_ps,
+#                                      'fraction_of_trajectory': all_fraction_of_trajectory,
+#                                      'weighted_average': all_weighted_average})
+
+#     # Convert the table to a DataFrame and format the numeric columns for
+#     # display in scientific notation with two decimals.
+#     property_statistics_df = pd.DataFrame(property_statistics_rows)
+#     for column in ['average_property',
+#                    'average_lifetime_ps',
+#                    'total_lifetime_ps',
+#                    'fraction_of_trajectory',
+#                    'weighted_average']:
+#         property_statistics_df[column] = property_statistics_df[column].map(lambda value: f'{value:.2e}')
+
+#     return property_statistics_df
 
 ##################################################################################################
 # Trajectory extraction functions using categorized events
@@ -1648,40 +1833,7 @@ def collision_event_trajectories(u,
         Index 2+: other partner atoms
     """
     # Retrieve the event DataFrame for the specified category, atom index, and event index
-    # Guard against a missing collision container entirely.
-    if categorized_collisions is None:
-        raise ValueError("categorized_collisions cannot be None.")
-
-    # Ensure the requested collision category exists before indexing into it.
-    if category not in categorized_collisions:
-        raise KeyError(f"Category '{category}' not found in categorized_collisions.")
-
-    # Ensure the requested atom has recorded events in this category.
-    if atom_index not in categorized_collisions[category]:
-        raise KeyError(f"Atom index {atom_index} not found in category '{category}'.")
-
-    events = categorized_collisions[category][atom_index]
-
-    # event_index must be an integer because it is used for list-style access.
-    if not isinstance(event_index, int):
-        raise TypeError("event_index must be an integer.")
-
-    # Reject invalid indices explicitly to provide a clearer error message.
-    if event_index < 0 or event_index >= len(events):
-        raise IndexError(
-            f"event_index {event_index} is out of range for atom index {atom_index} "
-            f"in category '{category}'."
-        )
-
-    event_df = events[event_index]
-
-    # Reject missing or empty event tables, since downstream trajectory extraction
-    # requires at least one valid frame entry.
-    if event_df is None or event_df.empty:
-        raise ValueError(
-            f"Collision event {event_index} for atom index {atom_index} "
-            f"in category '{category}' is empty."
-        )
+    event_df = categorized_collisions[category][atom_index][event_index]
 
     # Get the main partner index from the event
     main_partner_idx = main_partner_index(event_df)
@@ -1735,7 +1887,7 @@ def collision_event_trajectories(u,
 
 #############################################################################################################
 # Data saving functions
-#############################################################################################################    
+#############################################################################################################  
 def save_collision_event_trajectories(u,
                                       categorized_collisions, 
                                       directory='collision_trajectories'):
@@ -1829,11 +1981,9 @@ def sort_collision_statistics(collision_stats,
 
             # Sort the event list for each atom by the requested property.
             for atom_index, stats_list in atoms_dict.items():
-                sorted_stats[category][atom_index] = sorted(
-                    stats_list,
-                    key=lambda x: x[property_name],
-                    reverse=reverse
-                )
+                sorted_stats[category][atom_index] = sorted(stats_list,
+                                                            key=lambda x: x[property_name],
+                                                            reverse=reverse)
         else:
             combined_stats = []
 
@@ -1845,10 +1995,8 @@ def sort_collision_statistics(collision_stats,
                     combined_stats.append(event_stats_with_atom)
 
             # Sort the combined event list across all atoms.
-            sorted_stats[category] = sorted(
-                combined_stats,
-                key=lambda x: x[property_name],
-                reverse=reverse
-            )
+            sorted_stats[category] = sorted(combined_stats,
+                                            key=lambda x: x[property_name],
+                                            reverse=reverse)
 
     return sorted_stats

@@ -32,7 +32,8 @@ def ensemble_average_from_rdf(r, p_r, rdf, V=1.0, cumulative=False, N_other_atom
     integrand = rdf * p_r * 4 * np.pi * r**2
 
     # Compute the total (asymptotic) average normalized by volume
-    asymptotic = np.trapz(integrand, r) / V
+    # asymptotic = np.trapz(integrand, r) / V
+    asymptotic = np.trapezoid(integrand, r) / V
     
     # Scale by N_other_atoms if provided
     if N_other_atoms is not None:
@@ -98,6 +99,7 @@ def first_order_virial_coefficient(r, p_r, V_r, T):
     integrand = p_r * np.exp(-beta * V_r) * 4 * np.pi * r**2
 
     # Perform numerical integration using the trapezoidal rule
-    B_T = np.trapz(integrand, r)
+    # B_T = np.trapz(integrand, r)
+    B_T = np.trapezoid(integrand, r)
 
     return B_T
