@@ -1,85 +1,112 @@
 """
-MD trajectory analysis tool for gas phase MD simulations.
+Analysis of molecular dynamics trajectories of atomic gases.
+
+The module finds the collision events between the atoms of a gas-phase MD trajectory, classifies them into
+two-body scattering (TBS), multi-body scattering (MBS), perturbed scattering (PS) and van der Waals (vdW) events,
+and extracts their statistics and the averages of distance-dependent properties:
+
+1. find_collisions() records, for every frame, the atoms within a cutoff distance of each reference atom.
+2. process_collisions() groups these frame-wise records into events from the point of view of each reference
+   atom.
+3. categorize_collisions() classifies the events by the local minima of the distance of the main colliding
+   pair, the fraction of the event spent in the potential well, and the number of atoms involved.
+4. collision_statistics() and the functions that follow it give the event lifetimes, the numbers of atoms
+   involved, the atom-time fractions, the equilibrium constants and the collision rates.
+5. average_property_R_time_weighted() gives the time-weighted category averages of a property that depends only
+   on the interatomic distance R.
+
+All distances are in Å, and the time step between frames is given in seconds.
 """
 
-# TODO: OMP parallelization, thread number control (to 1) 
+# TODO: OMP parallelization, thread number control (to 1)
 
-###########################################################################################################
 # Imports
-###########################################################################################################
+import os
+from collections import Counter
+from collections.abc import Callable
+
+import MDAnalysis as mda
+import MDAnalysis.transformations as mda_trans
 import numpy as np
 import pandas as pd
-import os
-
+from joblib import Parallel, delayed
+from MDAnalysis.analysis import distances
+from MDAnalysis.analysis.rdf import InterRDF
+from MDAnalysis.coordinates.timestep import Timestep
 from scipy.signal import find_peaks
-
 from tqdm import tqdm
 
-from MDAnalysis.analysis.rdf import InterRDF
-from MDAnalysis.analysis import distances
-import MDAnalysis.transformations as mda_trans
 
-from joblib import Parallel, delayed
-from collections import Counter
-
-###########################################################################################################
+###################################################################################################################
 # Trajectory transformations
-###########################################################################################################
-def center_and_wrap(u, ts, group):
+###################################################################################################################
+def center_and_wrap(u: mda.Universe,
+                    ts: Timestep,
+                    group: mda.AtomGroup) -> None:
     """
-    Wrap the coordinates back into the box and center the trajectory
-    on the center of mass of the selected group.
+    Centre the selected group in the simulation box and wrap all atoms back into the box.
 
-    Parameters:
-    - u: MDAnalysis Universe
-        The MDAnalysis Universe object containing the trajectory and topology.
-    - ts: MDAnalysis Timestep
-        The current timestep of the trajectory to be transformed.
-    - group: MDAnalysis AtomGroup
-        The group of atoms to be centered.
+    The timestep is modified in place. The centring is done before the wrapping, so that the atoms around the
+    selected group are not split across the periodic boundaries.
 
-    Returns:
-    - ts: MDAnalysis Timestep
-        The transformed timestep.
+    Usage: ``center_and_wrap(u, u.trajectory.ts, group)``
+
+    Parameters
+    ----------
+    u : Universe
+        MDAnalysis Universe containing the trajectory and topology.
+    ts : Timestep
+        Current timestep of the trajectory, modified in place.
+    group : AtomGroup
+        Group of atoms placed at the centre of the box.
     """
-    # NOTE: This is the correct order of transformations
-    # Transform the trajectory by centering the selected group
+
+    # Move the centre of mass of the selected group to the centre of the box
     mda_trans.center_in_box(group)(ts)
 
-    # Wrap the coordinates back into the box
+    # Wrap the coordinates of all atoms back into the box
     mda_trans.wrap(u.atoms)(ts)
 
-###########################################################################################################
+
+###################################################################################################################
 # General functions
-###########################################################################################################
-def rdf(group1,
-        group2,
-        nbins = 100,
-        range=(0.0, 10.0)):
+###################################################################################################################
+def rdf(group1: mda.AtomGroup,
+        group2: mda.AtomGroup,
+        nbins: int=100,
+        range: tuple[float, float]=(0.0, 10.0)) -> tuple[np.ndarray, np.ndarray]:
     """
-    Calculate the radial distribution function (RDF) between two groups of atoms in a trajectory.
+    Calculate the radial distribution function (RDF) between two groups of atoms over the trajectory.
 
-    Parameters:
-    - group1: MDAnalysis AtomGroup
-    The first group of atoms.
-    - group2: MDAnalysis AtomGroup
-    The second group of atoms.
-    - nbins: int
-    The number of bins to use for the RDF histogram (default is 100).
-    - range: tuple
-    The range of distances to consider for the RDF histogram (default is (0.0, 10.0)).
+    The calculation uses MDAnalysis InterRDF. When the two groups are the same, the self-pairs are excluded, and
+    the RDF is normalised by the number of distinct pairs N(N - 1).
 
-    Returns:
-    - r: numpy array
-    The array of distance values corresponding to the RDF bins.
-    - g_r: numpy array
-    The radial distribution function values for each bin.
+    Usage: ``r, g_r = rdf(group1, group2)``
+
+    Parameters
+    ----------
+    group1 : AtomGroup
+        First group of atoms.
+    group2 : AtomGroup
+        Second group of atoms.
+    nbins : int, default=100
+        Number of bins of the RDF histogram.
+    range : tuple of float, default=(0.0, 10.0)
+        Range of distances of the RDF histogram in Å.
+
+    Returns
+    -------
+    r : ndarray
+        Centres of the distance bins in Å.
+    g_r : ndarray
+        Radial distribution function in each bin.
     """
-    # Create an RDF object and run the analysis
+
+    # Exclude the self-pairs when the two groups are the same
     if group1 == group2:
         rdf_analysis = InterRDF(group1,
                                 group2,
-                                exclusion_block=(1, 1),  # Exclude self-pairs for the same group
+                                exclusion_block=(1, 1),
                                 range=range,
                                 nbins=nbins)
     else:
@@ -87,325 +114,343 @@ def rdf(group1,
                                 group2,
                                 range=range,
                                 nbins=nbins)
+
+    # Accumulate the distance histogram over the trajectory
     rdf_analysis.run()
 
     return rdf_analysis.results.bins, rdf_analysis.results.rdf
 
-def angular_momentum(group1, 
-                     group2):
-    """
-    Calculate the angular momentum of two groups of atoms around their 
-    combined center of mass for the current timestep.
 
-    Parameters:
-    - group1: MDAnalysis AtomGroup
-        The first group of atoms.
-    - group2: MDAnalysis AtomGroup
-        The second group of atoms.
-
-    Returns:
-    - L: numpy array
-        The angular momentum vector for the current timestep.
+def angular_momentum(group1: mda.AtomGroup,
+                     group2: mda.AtomGroup) -> np.ndarray:
     """
+    Calculate the angular momentum of two groups of atoms about their combined centre of mass.
+
+    The angular momentum is evaluated for the current timestep of the trajectory.
+
+    Usage: ``L = angular_momentum(group1, group2)``
+
+    Parameters
+    ----------
+    group1 : AtomGroup
+        First group of atoms.
+    group2 : AtomGroup
+        Second group of atoms.
+
+    Returns
+    -------
+    L : ndarray
+        Angular momentum vector in the MDAnalysis units of mass, length and velocity.
+    """
+
     # Combine both groups
     combined_group = group1 + group2
 
-    # Calculate the center of mass of the combined group
+    # Centre of mass of the combined group
     com = combined_group.center_of_mass()
-    
-    # Initialize angular momentum for this timestep
-    L = np.zeros(3)
-    
-    # Calculate angular momentum contribution from all atoms in the combined group
-    r_rel = combined_group.positions - com  # Relative positions to COM
-    v = combined_group.velocities  # Velocities of atoms
-    masses = combined_group.masses[:, np.newaxis]  # Shape (N, 1) for broadcasting
+
+    # Positions relative to the centre of mass, velocities and masses shaped for broadcasting
+    r_rel = combined_group.positions - com
+    v = combined_group.velocities
+    masses = combined_group.masses[:, np.newaxis]
+
+    # Sum of the angular momenta of all atoms
     L = np.sum(np.cross(r_rel, masses * v), axis=0)
 
     return L
 
-def connector(group1,
-              group2):
-    """
-    Calculate the vector between the centers of mass of two groups of atoms for the current timestep.
-    Note: The vector points from the COM of group1 to the COM of group2.
 
-    Parameters:
-    - group1: MDAnalysis AtomGroup
-        The first group of atoms.
-    - group2: MDAnalysis AtomGroup
-        The second group of atoms.
-
-    Returns:
-    - r_vec: numpy array
-        The vector from the center of mass of group1 to the center of mass of group2 for the current timestep.
+def connector(group1: mda.AtomGroup,
+              group2: mda.AtomGroup) -> np.ndarray:
     """
-    # Calculate the center of mass for each group or use position if only one atom
+    Calculate the vector from the centre of mass of one group of atoms to that of another.
+
+    The vector is evaluated for the current timestep of the trajectory. For a group of one atom, its position
+    is used.
+
+    Usage: ``r_vec = connector(group1, group2)``
+
+    Parameters
+    ----------
+    group1 : AtomGroup
+        Group at the start of the vector.
+    group2 : AtomGroup
+        Group at the end of the vector.
+
+    Returns
+    -------
+    r_vec : ndarray
+        Vector from the centre of mass of group1 to that of group2 in Å.
+    """
+
+    # Centre of mass of each group, or the position for a single atom
     com1 = group1.center_of_mass() if len(group1) > 1 else group1.positions[0]
     com2 = group2.center_of_mass() if len(group2) > 1 else group2.positions[0]
-    
-    # Calculate the vector from com1 to com2
+
+    # Vector from the first centre of mass to the second
     r_vec = com2 - com1
 
     return r_vec
 
-###########################################################################################################
+
+###################################################################################################################
 # Atomic collision extraction and processing functions
-###########################################################################################################
-def find_collisions(u, 
-                    group1, 
-                    group2, 
-                    cutoff):
+###################################################################################################################
+def find_collisions(u: mda.Universe,
+                    group1: mda.AtomGroup,
+                    group2: mda.AtomGroup,
+                    cutoff: float) -> dict:
     """
-    Find collisions between atoms in two groups over the trajectory
-    based on a cutoff distance. Returns a dictionary with atom indices
-    from group1 as keys and a list of dictionaries for each frame as values.
-    
-    Inputs:
-    - u: MDAnalysis Universe
-        The MDAnalysis Universe object containing the trajectory and topology.
-    - group1: MDAnalysis AtomGroup
-        The first group of atoms.
-    - group2: MDAnalysis AtomGroup
-        The second group of atoms.
-    - cutoff: float
-        Distance cutoff for collision detection in Angstroms.
-    
-    Returns:
-    - collisions: dict
-        A dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of dictionaries, each representing a collision event for a specific frame.
-          Each collision event dictionary contains:
-          - 'frame': The frame number where the collision occurred.
-          - 'atoms2': A list of atom indices from group2 that collided with the atom from group1.
-          - 'distances': A list of distances (in Angstroms) between the group1 atom and the group2 atoms
-                        that collided with it in the given frame.
-    """    
-    # Initialize dictionary to store collisions for each atom in group1
+    Find the atoms of one group within a cutoff distance of each atom of another group in every frame.
+
+    The distances follow the minimum-image convention of the periodic box. Self-pairs are skipped.
+
+    Usage: ``collisions = find_collisions(u, group1, group2, cutoff)``
+
+    Parameters
+    ----------
+    u : Universe
+        MDAnalysis Universe containing the trajectory and topology.
+    group1 : AtomGroup
+        Reference atoms.
+    group2 : AtomGroup
+        Partner atoms.
+    cutoff : float
+        Cutoff distance in Å.
+
+    Returns
+    -------
+    collisions : dict
+        Atom index of each reference atom mapped to a list of frame records in chronological order. Each frame
+        record is a dictionary with the keys 'frame' (frame number), 'atoms2' (list of the atom indices of the
+        partners within the cutoff) and 'distances' (list of the corresponding distances in Å).
+    """
+
+    # Frame records of each reference atom
     collisions = {atom.index: [] for atom in group1}
-    
-    # Iterate over all frames in the trajectory
+
+    # Frame records of each reference atom indexed by the frame number, for appending further partners
+    frame_dict = {atom.index: {} for atom in group1}
+
+    # Iterate over all frames of the trajectory
     for ts in tqdm(u.trajectory, desc='Finding collisions'):
-        
-        # Compute the distance matrix between atoms in group1 and group2
+
+        # Distance matrix between the two groups with the minimum-image convention
         dists = distances.distance_array(group1.positions,
                                          group2.positions,
                                          box=u.dimensions)
-        
-        # Find pairs of atoms where the distance is less than the cutoff
+
+        # Pairs of atoms within the cutoff
         g1_indices, g2_indices = np.where(dists < cutoff)
 
-        # Loop over all pairs and avoid self-collisions
+        # Loop over all pairs and skip the self-pairs
         for i, j in zip(g1_indices, g2_indices):
             if group1.indices[i] != group2.indices[j]:
 
-                # Use a dictionary to track existing frames for each atom in group1
-                if 'frame_dict' not in locals():
-                    frame_dict = {atom.index: {} for atom in group1}
-
-                # Check if the current frame already exists for the atom
+                # Append the partner to the record of this frame if the record already exists
                 if ts.frame in frame_dict[group1.indices[i]]:
-                    
-                    # Retrieve the existing frame entry
                     frame_entry = frame_dict[group1.indices[i]][ts.frame]
-
-                    # Append atom2 and distance to the existing frame entry
                     frame_entry['atoms2'].append(group2.indices[j])
                     frame_entry['distances'].append(dists[i, j])
+
+                # Otherwise create a new record for this frame
                 else:
-                    # Create a new entry for the current frame with atom2 and distance
                     new_entry = {'frame': ts.frame,
                                  'atoms2': [group2.indices[j]],
                                  'distances': [dists[i, j]]}
-                    
                     collisions[group1.indices[i]].append(new_entry)
                     frame_dict[group1.indices[i]][ts.frame] = new_entry
-    
+
     return collisions
 
+
 # TODO: Later: Allowed atom indices can be generalized to MDAnalysis AtomGroups
-def process_collisions(collisions, 
-                       allowed_atom_indices=None):
+def process_collisions(collisions: dict,
+                       allowed_atom_indices: list[int] | None=None) -> dict:
     """
-    Process frame-wise collision data into event blocks using the legacy event definition.
+    Group the frame-wise collision records of each reference atom into events (first-partner rule).
 
-    In this version, each atom from group1 gets a sequence of collision events built
-    from consecutive collision frames. An event is continued only while:
-    1) frames remain contiguous, and
-    2) the first partner atom seen for that event remains present in `atoms2`.
+    An event of a reference atom starts when a partner enters the cutoff sphere. The first partner of the event
+    (the first atom in 'atoms2' of its first frame) anchors the event, which continues while
 
-    This means the event identity is anchored to the first observed partner for that
-    event. Unlike `process_collisions_by_partner`, overlapping partner-specific events
-    are not created from the same frame.
+    1. the frames remain consecutive, and
+    2. the first partner remains within the cutoff.
 
-    Inputs:
-    - collisions: dict
-        A dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of dictionaries, each representing a collision event for a specific frame.
-    - allowed_atom_indices: list of int, optional
-        If provided, only collisions where at least one allowed atom index appears in atoms2 are recorded.
+    Other atoms may enter and leave during the event. When the first partner leaves while other partners remain,
+    a new event anchored to one of them starts in the same frame. Each frame of a reference atom therefore
+    belongs to exactly one of its events. Unlike process_collisions_partner_specific(), no overlapping
+    partner-specific events are created.
 
-    Returns:
-    - processed_collisions: dict
-        A dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of pandas DataFrames, each representing a distinct collision event
-          under the legacy first-partner continuity rule.
+    Usage: ``events = process_collisions(collisions)``
+
+    Parameters
+    ----------
+    collisions : dict
+        Output of find_collisions().
+    allowed_atom_indices : list of int, default=None
+        If given, frames in which none of these atoms is within the cutoff are skipped.
+
+    Returns
+    -------
+    processed_collisions : dict
+        Atom index of each reference atom mapped to a list of events. Each event is a DataFrame with the columns
+        'frame', 'atoms2' and 'distances', one row per frame.
     """
+
+    # Events of all reference atoms and the optional partner filter as a set
     processed_collisions = {}
     allowed_set = set(allowed_atom_indices) if allowed_atom_indices is not None else None
-    
+
+    # Process the frame records of each reference atom separately
     for atom_index in tqdm(collisions, desc='Processing collisions'):
-        # Initialize a list to store distinct events for the current atom
+
+        # Finished events, the frames of the ongoing event, the previous frame and the anchor of the event
         events = []
-
-        # Temporary list to store collisions for the current event
         current_event = []
-
-        # Variable to track the frame of the previous collision
         previous_frame = None
-
-        # Variable to track the first atom for the current event
         first_atom = None
 
+        # Go through the frame records in chronological order
         for collision in collisions[atom_index]:
             frame = collision['frame']
             atoms2 = collision['atoms2']
 
-            # If allowed_atom_indices is given, skip collision if no allowed atom index in atoms2
+            # Skip the frame if none of the allowed atoms is within the cutoff
             if allowed_set is not None and not any(atom in allowed_set for atom in atoms2):
                 continue
 
-            # Identify the first atom at the first frame of the event
+            # Set the anchor of a new event to the first partner of its first frame
             if first_atom is None and atoms2:
                 first_atom = atoms2[0]
 
-            # Check if the frame gap is greater than 1 or the first atom is no longer in atoms2
+            # End the ongoing event at a frame gap or when its anchor has left the cutoff sphere
             if (previous_frame is not None and frame - previous_frame > 1) or (first_atom not in atoms2):
-                
-                # If so, finalize the current event and start a new one
-                if current_event:  # Ensure the current event is not empty
+                if current_event:
                     events.append(current_event)
                 current_event = []
-                first_atom = None  # Reset the first atom for the new event
+                first_atom = None
 
-            # TODO: Does this need to be here? 
-            # Ensure the first atom is still valid for the ongoing event
+            # Anchor a newly started event to the first partner of the current frame. This is needed because the
+            # anchor is reset above, after the anchor assignment at the start of the iteration.
             if first_atom not in atoms2:
                 first_atom = atoms2[0] if atoms2 else None
 
-            # Add the current collision to the ongoing event
+            # Add the frame to the ongoing event
             current_event.append(collision)
-            
-            # Update the previous frame to the current frame
             previous_frame = frame
 
-        # Add the last event if it exists
+        # Add the last event
         if current_event:
             events.append(current_event)
 
-        # Flatten events into separate entries as DataFrames
+        # Convert each event into a DataFrame
         processed_collisions[atom_index] = []
         for event in events:
             processed_collisions[atom_index].append(pd.DataFrame(event))
-    
+
     return processed_collisions
+
 
 # TODO: Later: Allowed atom indices can be generalized to MDAnalysis AtomGroups
 # TODO: Human check this function
-def process_collisions_partner_specific(collisions, 
-                                        allowed_atom_indices=None):
+def process_collisions_partner_specific(collisions: dict,
+                                        allowed_atom_indices: list[int] | None=None) -> dict:
     """
-    Process frame-wise collision data into partner-specific collision events.
+    Group the frame-wise collision records of each reference atom into partner-specific events.
 
-    Unlike `process_collisions`, this version does not anchor an event to only the
-    first observed partner. Instead, for each atom in group1, collision frames are
-    split into separate events for each partner atom in `atoms2`. A partner-specific
-    event starts when that partner appears and ends when:
-    1) the partner is absent in the next processed frame, or
-    2) a frame gap larger than 1 occurs.
+    Unlike process_collisions(), an event is created separately for every partner of the reference atom. A
+    partner-specific event starts when the partner enters the cutoff sphere and ends when
 
-    If multiple partners are present in the same frame, that frame can appear in more
-    than one processed event. Within each event row, the selected partner is reordered
-    to appear first in `atoms2`, and its distance is reordered to appear first in
-    `distances`.
+    1. the partner is absent in the next processed frame, or
+    2. there is a frame gap.
 
-    Parameters:
-    - collisions: dict
-        Dictionary keyed by atom indices from group1. Each value is a list of
-        dictionaries with keys 'frame', 'atoms2', and 'distances'.
-    - allowed_atom_indices: list of int, optional
-        If provided, only partner atoms with indices in this list are used to
-        define processed events.
+    A frame with several partners therefore belongs to several events. In each row of an event, the partner of
+    the event is moved to the first position of 'atoms2', and its distance to the first position of
+    'distances'.
 
-    Returns:
-    - processed_collisions: dict
-        Dictionary keyed by atom indices from group1. Each value is a list of
-        pandas DataFrames, where each DataFrame represents one partner-specific
-        collision event.
+    Usage: ``events = process_collisions_partner_specific(collisions)``
+
+    Parameters
+    ----------
+    collisions : dict
+        Output of find_collisions().
+    allowed_atom_indices : list of int, default=None
+        If given, only these atoms define partner-specific events.
+
+    Returns
+    -------
+    processed_collisions : dict
+        Atom index of each reference atom mapped to a list of partner-specific events, sorted by the start frame
+        and the partner index. Each event is a DataFrame with the columns 'frame', 'atoms2' and 'distances'.
     """
-    # Store the final processed events for each atom in group1.
+
+    # Events of all reference atoms and the optional partner filter as a set
     processed_collisions = {}
-
-    # Convert the optional partner filter to a set for faster membership checks.
     allowed_set = set(allowed_atom_indices) if allowed_atom_indices is not None else None
 
-    # Build a partner-specific version of a collision frame.
-    # The selected partner is moved to the first position so downstream code
-    # can treat it as the primary partner for that event.
-    def collision_for_partner(collision, partner_atom):
+    def collision_for_partner(collision: dict,
+                              partner_atom: int) -> dict:
+        """
+        Reorder a frame record so that the given partner and its distance come first.
+
+        Parameters
+        ----------
+        collision : dict
+            Frame record with the keys 'frame', 'atoms2' and 'distances'.
+        partner_atom : int
+            Atom index of the partner that is moved to the first position.
+
+        Returns
+        -------
+        reordered_collision : dict
+            Frame record with the partner first and the other partners in their original order.
+        """
+
+        # Copy the partners and distances and locate the selected partner
         atoms2 = list(collision['atoms2'])
         distances2 = list(collision['distances'])
         partner_position = atoms2.index(partner_atom)
 
-        # Start with the selected partner.
+        # Start with the selected partner
         reordered_atoms2 = [atoms2[partner_position]]
         reordered_distances = [distances2[partner_position]]
 
-        # Preserve any additional simultaneous partners after the main one.
+        # Keep the other simultaneous partners after the selected one
         for i, atom2 in enumerate(atoms2):
             if i == partner_position:
                 continue
-
             reordered_atoms2.append(atom2)
             reordered_distances.append(distances2[i])
 
         return {'frame': collision['frame'],
                 'atoms2': reordered_atoms2,
                 'distances': reordered_distances}
-    
-    # Process collisions independently for each atom from group1.
+
+    # Process the frame records of each reference atom separately
     for atom_index in tqdm(collisions, desc='Processing collisions'):
-        
-        # Collect finalized events before converting them to DataFrames.
-        # Each record stores:
-        # (event start frame, partner atom index, list of frame dictionaries)
+
+        # Finished events as tuples (start frame, partner atom index, list of frame records)
         event_records = []
 
-        # Keep track of currently active events for each partner atom.
-        # This allows multiple overlapping partner-specific events.
+        # Ongoing events keyed by the partner atom index, which allows overlapping events
         active_events = {}
 
-        # Iterate through the frame-wise collision records for this atom.
+        # Go through the frame records in chronological order
         for collision in collisions[atom_index]:
             frame = collision['frame']
             atoms2 = list(collision['atoms2'])
 
-            # Apply optional filtering so only selected partners define events.
+            # Partners that may define events in this frame
             if allowed_set is None:
                 current_partners = atoms2
             else:
                 current_partners = [atom for atom in atoms2 if atom in allowed_set]
 
-            # Ignore frames with no relevant partners.
+            # Skip frames without relevant partners
             if not current_partners:
                 continue
 
-            # Close any active partner event if:
-            # 1) there is a frame gap larger than 1, or
-            # 2) the partner is no longer present in the current frame.
+            # End the ongoing events at a frame gap or when their partner is no longer within the cutoff
             for partner_atom in list(active_events):
                 previous_frame = active_events[partner_atom]['previous_frame']
                 if frame - previous_frame > 1 or partner_atom not in current_partners:
@@ -414,145 +459,164 @@ def process_collisions_partner_specific(collisions,
                                           active_events[partner_atom]['rows']))
                     del active_events[partner_atom]
 
-            # Update or start an event for every partner present in this frame.
+            # Continue or start an event for every partner present in this frame
             for partner_atom in current_partners:
                 if partner_atom not in active_events:
                     active_events[partner_atom] = {'rows': [],
                                                    'previous_frame': frame,
                                                    'start_frame': frame}
 
-                # Append a reordered frame entry where this partner is first.
+                # Append the frame record with this partner first
                 active_events[partner_atom]['rows'].append(collision_for_partner(collision, partner_atom))
                 active_events[partner_atom]['previous_frame'] = frame
 
-        # Finalize any events still active after the last frame.
+        # Finish the events still ongoing after the last frame
         for partner_atom, event_data in active_events.items():
             event_records.append((event_data['start_frame'],
                                   partner_atom,
                                   event_data['rows']))
 
-        # Sort events deterministically by start frame and partner index,
-        # then convert each event to a DataFrame.
+        # Sort the events by start frame and partner index and convert each into a DataFrame
         processed_collisions[atom_index] = []
         for _, _, event_rows in sorted(event_records, key=lambda item: (item[0], item[1])):
             processed_collisions[atom_index].append(pd.DataFrame(event_rows))
-    
+
     return processed_collisions
 
-def categorize_collisions(processed_collisions, 
-                          cutoff,
-                          dt,
-                          vdw_bond_length,
-                          distance_minima_prominence=0.25,
-                          n_jobs=-1,
-                          allowed_atom_indices=None,
-                          vdw_well_occupancy=0.75):
+
+def categorize_collisions(processed_collisions: dict,
+                          cutoff: float,
+                          dt: float,
+                          vdw_bond_length: float,
+                          distance_minima_prominence: float=0.25,
+                          n_jobs: int=-1,
+                          allowed_atom_indices: list[int] | None=None,
+                          vdw_well_occupancy: float | None=0.75) -> dict:
     """
-    Categorize collisions into different categories based on collision properties.
+    Classify the collision events into two-body scattering, multi-body scattering, perturbed scattering and
+    van der Waals events.
 
-    The classification uses the local minima of the distance series of the main colliding pair, the
-    fraction of the event that the pair spends in the potential well, and the number of atoms involved.
-    It involves no lifetime criterion.
+    The classification uses the distance R(t) between the reference atom and the main partner (see
+    main_partner_index()) and involves no lifetime criterion. With the well region defined as
+    vdw_bond_length ± 0.75 Å, the rules are applied in the following order:
 
-    Inputs:
-    - processed_collisions: dict
-        A dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of pandas DataFrames, each representing a distinct collision.
-        Note: This can be the output of either process_collisions() or process_collisions_partner_specific().
-              Both versions produce valid input, but will yield different categorization results.
-              process_collisions() uses legacy first-partner continuity, while 
-              process_collisions_partner_specific() creates partner-specific events.
-    - cutoff: float
-        Distance cutoff used for collision detection in Angstroms.
-    - dt: float
-        Time step between frames in seconds.
-    - vdw_bond_length: float
-        The van der Waals bond length in Angstroms. This corresponds to the energy minimum
-        distance of the two-atom pair. The classification threshold is taken as ±0.75 Å
-        around this value.
-    - distance_minima_prominence: float
-        The prominence for distance minima. Default is 0.25.
-    - n_jobs: int
-        Number of CPUs for parallel processing. Default is -1 (use all available).
-    - allowed_atom_indices: list of int, optional
-        If provided, only collisions where at least one allowed atom index appears in atoms2 are considered.
-    - vdw_well_occupancy: float or None
-        An event is classified directly as vdW when at least this fraction of its main-pair distances lies
-        within ±0.75 Å of vdw_bond_length. This captures bound pairs on nearly circular orbits, whose radial
-        oscillations are too shallow to be resolved as distance minima. Default is 0.75. None disables the
-        criterion. For gas-phase Xe, all events that meet the criterion last longer than 50 ps, so it
-        reproduces the earlier rule that additionally required a lifetime above 10 ps.
+    1. vdW if the fraction of the frames with R(t) in the well region is at least vdw_well_occupancy. This
+       catches bound pairs on nearly circular orbits, whose radial oscillations are too shallow to be
+       resolved as distance minima.
+    2. Otherwise, the local minima of R(t) with the given prominence are counted (N_min), together with the
+       minima below vdw_bond_length + 0.75 Å (n_min). The event is
 
-    Returns:
-    - categorized_collisions: dict
-        A dictionary with four keys: 'two_body_scattering', 'multi_body_scattering', 'perturbed_scattering', 'vdw'.
-        Each key maps to a dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of pandas DataFrames representing the categorized collisions.
-        Every processed collision event is assigned to one of these
-        categories, including short partner-specific events with no
-        detected local minimum.
+       - two-body scattering if N_min <= 1 and only one partner is within the cutoff in every frame,
+       - multi-body scattering if N_min <= 1 and two or more partners are within the cutoff in some frame,
+       - perturbed scattering if N_min > 1 and n_min <= 2, and
+       - vdW if N_min > 1 and n_min > 2.
+
+    Usage: ``categorized = categorize_collisions(events, cutoff, dt, vdw_bond_length)``
+
+    Parameters
+    ----------
+    processed_collisions : dict
+        Output of process_collisions() or process_collisions_partner_specific(). Both are valid input but give
+        different results: process_collisions() uses the first-partner rule, whereas
+        process_collisions_partner_specific() creates partner-specific events.
+    cutoff : float
+        Cutoff distance used in the collision detection in Å.
+    dt : float
+        Time step between frames in seconds. It is not used by the classification and is kept for
+        compatibility with earlier calls.
+    vdw_bond_length : float
+        Distance of the minimum of the pair potential in Å.
+    distance_minima_prominence : float, default=0.25
+        Minimum prominence of a local minimum of R(t) in Å.
+    n_jobs : int, default=-1
+        Number of parallel processes over the reference atoms. The value -1 uses all available CPUs.
+    allowed_atom_indices : list of int, default=None
+        If given, events in which none of these atoms is a partner are skipped, and only these atoms are
+        considered as the main partner.
+    vdw_well_occupancy : float or None, default=0.75
+        Minimum fraction of the frames in the well region for the direct vdW assignment of rule 1. None
+        disables the rule. For gas-phase Xe, all events that meet the criterion last longer than 50 ps.
+
+    Returns
+    -------
+    categorized_collisions : dict
+        Dictionary with the keys 'two_body_scattering', 'multi_body_scattering', 'perturbed_scattering' and
+        'vdw'. Each maps the atom index of a reference atom to the list of its events in that category, as
+        DataFrames. Reference atoms without events in a category are omitted from it. Every processed event,
+        including short events without a resolved minimum, is assigned to one category.
     """
-    # Define the vdW classification threshold as ±0.75 Å around the bond length
+
+    # Well region of ±0.75 Å around the minimum of the pair potential
     vdw_bond_threshold = (vdw_bond_length - 0.75, vdw_bond_length + 0.75)
 
-    # Helper function to process collisions for a single atom
-    def process_atom(atom_index, collisions):
+    def process_atom(atom_index: int,
+                     collisions: list) -> tuple[int, dict]:
+        """
+        Classify the events of one reference atom.
 
-        # Initialize categories for the atom
-        categorized = {'two_body_scattering': [], 
-                    'multi_body_scattering': [], 
-                    'perturbed_scattering': [],
-                    'vdw': []}
-        
-        # Create a set of allowed atom indices for quick lookup if provided
+        Parameters
+        ----------
+        atom_index : int
+            Atom index of the reference atom.
+        collisions : list
+            Events of the reference atom as DataFrames.
+
+        Returns
+        -------
+        atom_index : int
+            Atom index of the reference atom.
+        categorized : dict
+            Category mapped to the list of events of the reference atom in that category.
+        """
+
+        # Event lists of the four categories
+        categorized = {'two_body_scattering': [],
+                       'multi_body_scattering': [],
+                       'perturbed_scattering': [],
+                       'vdw': []}
+
+        # Set of the allowed atom indices for fast lookup
         allowed_set = set(allowed_atom_indices) if allowed_atom_indices is not None else None
 
-        # Iterate over each collision for the atom
+        # Classify each event of the reference atom
         for collision_df in collisions:
 
-            # If allowed_atom_indices is given, skip collision if no allowed atom index in atoms2
+            # Skip the event if none of the allowed atoms is a partner in it
             if allowed_set is not None:
                 atoms2_all = set(atom for sublist in collision_df['atoms2'] for atom in sublist)
                 if not atoms2_all.intersection(allowed_set):
                     continue
 
-            # Check if the collision involves multiple colliding atoms
+            # Multi-body event if two or more partners are within the cutoff in some frame
             is_multi_body = collision_df['atoms2'].str.len().max() > 1
-            
-            # Extract the distance series for the main colliding partner
-            main_atom_distances = main_partner_distance_series(collision_df, 
+
+            # Distance series of the main pair
+            main_atom_distances = main_partner_distance_series(collision_df,
                                                                allowed_atom_indices=allowed_atom_indices)
-            
-            # Classify events in which the pair stays in the potential well for most of the time directly as vdW
+
+            # Classify events in which the pair spends most of the time in the potential well directly as vdW
             if vdw_well_occupancy is not None:
 
-                # Calculate the fraction of distances within the vdW threshold range
+                # Fraction of the frames in the well region
                 within_threshold = np.sum((main_atom_distances >= vdw_bond_threshold[0]) &
                                           (main_atom_distances <= vdw_bond_threshold[1]))
                 fraction_within_threshold = within_threshold / len(main_atom_distances)
 
-                # Classify as vdW if the fraction reaches the well-occupancy threshold
+                # Assign to vdW if the fraction reaches the well-occupancy threshold
                 if fraction_within_threshold >= vdw_well_occupancy:
                     categorized['vdw'].append(collision_df)
                     continue
 
-            # Find the indices of local minima in the negated and shifted distance series
-            shifted_neg_distances = -main_atom_distances + cutoff  # shift to start from zero
+            # Local minima of the distance as the peaks of the negated distance, shifted to start from zero
+            shifted_neg_distances = -main_atom_distances + cutoff
             minima_indices, _ = find_peaks(shifted_neg_distances,
                                            prominence=distance_minima_prominence)
-            
-            # Count the number of local minima
+
+            # Number of all local minima and of those below the upper edge of the well region
             num_minima = len(minima_indices)
-
-            # Count the number of local minima that are below the vdW bond length + 0.75 Å
             num_minima_below_vdw = np.sum(main_atom_distances[minima_indices] < (vdw_bond_length + 0.75))
-            # num_minima_below_vdw = np.sum(main_atom_distances[minima_indices] < (vdw_bond_length + 1.0)) # NOTE
 
-            # Categorize the collision based on its properties.
-            # Partner-specific processing can yield short events with no
-            # resolved local minimum, but these must still be retained.
+            # Classify by the number of minima. Events with no resolved minimum go to the scattering categories.
             if num_minima <= 1:
                 if is_multi_body:
                     categorized['multi_body_scattering'].append(collision_df)
@@ -566,18 +630,16 @@ def categorize_collisions(processed_collisions,
 
         return atom_index, categorized
 
-    # Parallel processing of collisions for all atoms
+    # Classify the events of all reference atoms in parallel
     results = Parallel(n_jobs=n_jobs)(delayed(process_atom)(atom_index, collisions)
-                                      for atom_index, collisions in tqdm(processed_collisions.items(), 
+                                      for atom_index, collisions in tqdm(processed_collisions.items(),
                                                                          desc='Categorizing collisions'))
 
-    # Combine results from all atoms into the final categorized collisions dictionary
-    categorized_collisions = {'two_body_scattering': {}, 
-                              'multi_body_scattering': {}, 
+    # Combine the results of all reference atoms, omitting empty event lists
+    categorized_collisions = {'two_body_scattering': {},
+                              'multi_body_scattering': {},
                               'perturbed_scattering': {},
                               'vdw': {}}
-
-    # Iterate over the results and populate the categorized_collisions dictionary
     for atom_index, categorized in results:
         for category in categorized_collisions:
             if categorized[category]:
@@ -585,83 +647,90 @@ def categorize_collisions(processed_collisions,
 
     return categorized_collisions
 
-###########################################################################################################
+
+###################################################################################################################
 # Helper functions
-###########################################################################################################
-def main_partner_index(collision, 
-                       allowed_atom_indices=None):
+###################################################################################################################
+def main_partner_index(collision: pd.DataFrame,
+                       allowed_atom_indices: list[int] | None=None) -> int | None:
     """
-    Identify the main partner atom index in a collision event based on the number of frames it is present in.
+    Identify the main partner of a collision event as the partner present in the largest number of frames.
 
-    The main partner is defined as the atom from group2 that is present in the most frames of the collision event.
-    If allowed_atom_indices is provided, only those atoms are considered as potential main partners.
+    Ties are resolved in favour of the partner that appears first in the event. Under the first-partner rule of
+    process_collisions(), the anchor of the event is present in every frame, so the main partner is always
+    present in every frame as well.
 
-    Inputs:
-    - collision: pandas DataFrame
-        A DataFrame representing a collision, containing columns 'frame', 'atoms2', and 'distances'.
-    - allowed_atom_indices: list of int, optional
-        If provided, only these atom indices are considered as potential main partners.
+    Usage: ``main_partner = main_partner_index(event_df)``
 
-    Returns:
-    - main_partner_index: int
-        The atom index of the main colliding partner.
+    Parameters
+    ----------
+    collision : DataFrame
+        Collision event with the columns 'frame', 'atoms2' and 'distances'.
+    allowed_atom_indices : list of int, default=None
+        If given, only these atoms are considered as the main partner.
+
+    Returns
+    -------
+    main_partner_index : int or None
+        Atom index of the main partner, or None if the event has no eligible partner.
     """
-    # Build a counter for how many frames each partner atom is present in
+
+    # Number of frames in which each partner is present
     partner_counts = Counter()
-
-    # Iterate over each row in the collision DataFrame
     for row in collision.itertuples():
-        atoms2 = row.atoms2
+        for atom in row.atoms2:
 
-        # Loop through each partner atom
-        for atom in atoms2:
-            # If allowed_atom_indices is provided, skip atoms not in the allowed list
+            # Skip atoms outside the allowed list
             if allowed_atom_indices is not None and atom not in allowed_atom_indices:
                 continue
 
-            # Increment the count for this atom
             partner_counts[atom] += 1
 
-    # If no partner atoms were found, return None
+    # No eligible partner in the event
     if not partner_counts:
         return None
 
-    # Select the atom with the highest count as the main partner
+    # Partner present in the largest number of frames
     main_partner_index = partner_counts.most_common(1)[0][0]
 
     return main_partner_index
 
-def main_partner_distance_series(collision, 
-                                 allowed_atom_indices=None):
+
+def main_partner_distance_series(collision: pd.DataFrame,
+                                 allowed_atom_indices: list[int] | None=None) -> np.ndarray:
     """
-    Extract the distance series for the main colliding partner in a collision.
+    Extract the distance series between the reference atom and the main partner of a collision event.
 
-    The main partner is defined as the atom from group2 that is present in the most frames
-    of the collision event (see main_partner_index()).
-    If allowed_atom_indices is provided, only those atoms are considered as potential main partners.
+    The main partner is the partner present in the largest number of frames (see main_partner_index()).
 
-    Inputs:
-    - collision: pandas DataFrame
-        A DataFrame representing a collision, containing columns 'frame', 'atoms2', and 'distances'.
-    - allowed_atom_indices: list of int, optional
-        If provided, only these atom indices are considered as potential main partners.
+    Usage: ``distances = main_partner_distance_series(event_df)``
 
-    Returns:
-    - distances: numpy array
-        An array of distances between the main colliding partner and the atom from group1 for each frame in the collision.
-        If the main partner is not present in a frame, the distance for that frame will be NaN.
+    Parameters
+    ----------
+    collision : DataFrame
+        Collision event with the columns 'frame', 'atoms2' and 'distances'.
+    allowed_atom_indices : list of int, default=None
+        If given, only these atoms are considered as the main partner.
+
+    Returns
+    -------
+    distances : ndarray
+        Distance in Å between the reference atom and the main partner in each frame of the event. The distance
+        is NaN in the frames where the main partner is absent, and in all frames if there is no main partner.
     """
-    # Identify the main partner atom index using the helper function
-    main_partner_idx = main_partner_index(collision, 
+
+    # Main partner of the event
+    main_partner_idx = main_partner_index(collision,
                                           allowed_atom_indices=allowed_atom_indices)
 
-    # Preallocate an array with NaN values to store distances for each frame
+    # Distances initialised to NaN for the frames without the main partner
     distances = np.full(len(collision), np.nan)
 
+    # No main partner in the event
     if main_partner_idx is None:
         return distances
 
-    # Iterate over each row in the collision DataFrame to extract the distance for the main partner
+    # Distance to the main partner in each frame where it is present
     for i, row in enumerate(collision.itertuples()):
         if main_partner_idx in row.atoms2:
             partner_index = row.atoms2.index(main_partner_idx)
@@ -669,207 +738,259 @@ def main_partner_distance_series(collision,
 
     return distances
 
-def distance_series(collision, 
-                    allowed_atom_indices=None):
-    """
-    Extract the distance series for all colliding partners in a collision.
-    If allowed_atom_indices is provided, only those atoms are considered as potential colliding partners.
 
-    Inputs:
-    - collision: pandas DataFrame
-        A DataFrame representing a collision, containing columns 'frame', 'atoms2', and 'distances'.
-    - allowed_atom_indices: list of int, optional
-        If provided, only these atom indices are considered as potential colliding partners.
-
-    Returns:
-    - distance_dict: dict
-        A dictionary where:
-        - Keys are atom indices of colliding partners from group2.
-        - Values are numpy arrays of distances between the corresponding partner and the atom from group1 for
-            each frame in the collision. If a partner is not present in a frame, the distance for that frame will be NaN.
+def distance_series(collision: pd.DataFrame,
+                    allowed_atom_indices: list[int] | None=None) -> dict:
     """
+    Extract the distance series between the reference atom and each partner of a collision event.
+
+    Usage: ``distance_dict = distance_series(event_df)``
+
+    Parameters
+    ----------
+    collision : DataFrame
+        Collision event with the columns 'frame', 'atoms2' and 'distances'.
+    allowed_atom_indices : list of int, default=None
+        If given, only these atoms are included.
+
+    Returns
+    -------
+    distance_dict : dict
+        Atom index of each partner mapped to an array of its distances in Å from the reference atom in each
+        frame of the event. The distance is NaN in the frames where the partner is absent.
+    """
+
+    # Distance series of each partner
     distance_dict = {}
 
-    # Iterate over each frame (row) in the collision DataFrame
+    # Go through the frames of the event
     for i, row in enumerate(collision.itertuples()):
 
-        # Loop through all partner atoms in this frame
+        # Go through the partners present in this frame
         for j, atom_index in enumerate(row.atoms2):
 
-            # Skip atoms not in allowed_atom_indices if provided
+            # Skip atoms outside the allowed list
             if allowed_atom_indices is not None and atom_index not in allowed_atom_indices:
                 continue
 
-            # Initialize the distance array for this partner if not already present
+            # Initialise the distance series of a new partner with NaN
             if atom_index not in distance_dict:
                 distance_dict[atom_index] = np.full(len(collision), np.nan)
 
-            # Set the distance for this frame
+            # Store the distance of this frame
             distance_dict[atom_index][i] = row.distances[j]
 
     return distance_dict
 
-###########################################################################################################
+
+###################################################################################################################
 # Atomic collision analysis functions
-###########################################################################################################
+###################################################################################################################
 # TODO: Check everything below
-def collision_statistics(categorized_events, 
-                         dt, 
-                         total_frames):
+def collision_statistics(categorized_events: dict,
+                         dt: float,
+                         total_frames: int,
+                         return_cluster_changes: bool=False) -> tuple[dict, dict] | tuple[dict, dict, dict]:
     """
-    Extract statistics from categorized events: Lifetime, number of atoms involved, and cluster counts over time.
+    Extract the statistics of the classified events and the number of clusters of each category in each frame.
 
-    Inputs:
-    - categorized_events: dict
-        A dictionary with four keys: 'two_body_scattering', 'multi_body_scattering', 'perturbed_scattering', 'vdw'.
-        Each key maps to a dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of pandas DataFrames representing the categorized events.
-    - dt: float
-        The time step between frames in seconds.
-    - total_frames: int
-        The total number of frames in the trajectory.
+    For each event, the lifetime, the number of atoms involved, the mean number of atoms per frame and the mean
+    distance of the main pair are recorded. In addition, the atoms of all events of a category present in the
+    same frame are merged into connected clusters, which gives the number of clusters of each category in each
+    frame. Optionally, the births and deaths of the clusters are counted in each frame: a cluster is born in
+    frame t if none of its atoms belongs to a cluster of the same category in frame t - 1, and a cluster of
+    frame t - 1 dies in frame t if none of its atoms belongs to a cluster of the same category in frame t.
+    Clusters that merge, split or change their members are neither born nor dead.
 
-    Returns:
-    - collision_stats: dict
-        A dictionary with the same structure as categorized_events, where each category maps to a dictionary
-        with atom indices as keys and lists of dictionaries as values. Each dictionary in the list contains
-        statistics for each event:
-        - 'event_index': The index of the event within the list of events
-            for that atom in the category.
-        - 'lifetime_ps': The lifetime of the event in picoseconds.
-        - 'num_atoms_involved': The number of unique atoms involved in the event (including the atom itself).
-        - 'avg_num_atoms': The average number of atoms present per frame during the event.
-        - 'avg_main_partner_distance': The average distance in Angstroms
-          between the reference atom and the main colliding partner during
-          the event.
-    - cluster_counts: dict
-        A dictionary with the same keys as categorized_events, where each value is an array of length total_frames.
-        Each element in the array represents the number of connected atom clusters at that frame for the corresponding category.
+    Usage: ``collision_stats, cluster_counts, cluster_changes = collision_statistics(categorized, dt,
+    total_frames, return_cluster_changes=True)``
+
+    Parameters
+    ----------
+    categorized_events : dict
+        Output of categorize_collisions().
+    dt : float
+        Time step between frames in seconds.
+    total_frames : int
+        Total number of frames in the trajectory.
+    return_cluster_changes : bool, default=False
+        If True, also return the numbers of cluster births and deaths in each frame.
+
+    Returns
+    -------
+    collision_stats : dict
+        Same nested structure as categorized_events, with each event replaced by a dictionary with the keys
+
+        - 'event_index': index of the event in the event list of the reference atom in the category,
+        - 'lifetime_ps': lifetime of the event in ps,
+        - 'num_atoms_involved': number of distinct atoms involved, including the reference atom,
+        - 'avg_num_atoms': mean number of atoms per frame, including the reference atom, and
+        - 'avg_main_partner_distance': mean distance between the reference atom and the main partner in Å.
+
+    cluster_counts : dict
+        Category mapped to an integer array of length total_frames with the number of connected clusters of
+        that category in each frame.
+    cluster_changes : dict
+        Category mapped to a dictionary with the keys 'births' and 'deaths', integer arrays of length
+        total_frames with the numbers of cluster births and deaths in each frame. Both are zero in the first
+        frame. Returned only if return_cluster_changes is True.
     """
-    # Merge one set of cluster atoms into the list of frame-local connected
-    # clusters, combining any overlapping atom sets into a single component.
-    def merge_frame_cluster(frame_clusters, cluster_atoms):
+
+    def merge_frame_cluster(frame_clusters: list,
+                            cluster_atoms: set) -> list:
+        """
+        Merge a set of atoms into the connected clusters of a frame.
+
+        Parameters
+        ----------
+        frame_clusters : list of set
+            Connected clusters of the frame found so far.
+        cluster_atoms : set
+            Atoms of one event row.
+
+        Returns
+        -------
+        remaining_clusters : list of set
+            Connected clusters of the frame, with all clusters overlapping cluster_atoms merged into one.
+        """
+
+        # Merge every existing cluster that shares an atom with the new set
         merged_cluster = set(cluster_atoms)
         remaining_clusters = []
-
         for existing_cluster in frame_clusters:
             if merged_cluster.intersection(existing_cluster):
                 merged_cluster.update(existing_cluster)
             else:
                 remaining_clusters.append(existing_cluster)
 
+        # Add the merged cluster
         remaining_clusters.append(merged_cluster)
 
         return remaining_clusters
 
-    # Initialize a dictionary to store statistics for each category and atom index
+    # Event statistics, cluster counts and the connected clusters of each frame for each category
     collision_stats = {category: {} for category in categorized_events}
-    
-    # Initialize a dictionary to store cluster counts for each category
     cluster_counts = {category: np.zeros(total_frames, dtype=int) for category in categorized_events}
-    
-    # Create a dictionary to track connected clusters per frame for each
-    # category.
     cluster_set = {category: {} for category in categorized_events}
 
-    # Iterate over each category in the categorized events
+    # Go through the categories
     for category in categorized_events:
 
-        # Process each atom in the current category
+        # Go through the reference atoms of the category
         for atom_index in tqdm(categorized_events[category], desc=f'Extracting statistics for {category}'):
 
-            # Initialize list to store statistics for this atom
+            # Statistics of the events of this reference atom
             collision_stats[category][atom_index] = []
 
-            # Process each event for the current atom.
+            # Go through the events of the reference atom
             for event_index, event_df in enumerate(categorized_events[category][atom_index]):
 
-                # Calculate the lifetime of the event in picoseconds
+                # Lifetime of the event in ps
                 event_duration = event_df['frame'].max() - event_df['frame'].min() + 1
-                lifetime = event_duration * dt * 1e12  # in ps
-                
-                # Identify the unique atoms involved in the event
+                lifetime = event_duration * dt * 1e12
+
+                # Number of distinct atoms involved, including the reference atom
                 unique_atoms = set(atom for sublist in event_df['atoms2'] for atom in sublist)
-                
-                # Calculate the total number of atoms involved (including the main atom)
-                num_atoms_involved = len(unique_atoms) + 1  # Add 1 for the atom itself
-                
-                # Calculate the average number of atoms present per frame during the event
+                num_atoms_involved = len(unique_atoms) + 1
+
+                # Mean number of atoms per frame, including the reference atom
                 num_frames = len(event_df)
                 total_atoms_per_frame = sum(len(atoms2_list) + 1 for atoms2_list in event_df['atoms2'])
                 avg_num_atoms = total_atoms_per_frame / num_frames if num_frames > 0 else 0
 
-                # Calculate the average distance to the main colliding partner.
+                # Mean distance to the main partner
                 main_partner_distances = main_partner_distance_series(event_df)
                 if np.all(np.isnan(main_partner_distances)):
                     avg_main_partner_distance = np.nan
                 else:
                     avg_main_partner_distance = np.nanmean(main_partner_distances)
-                
-                # Append the statistics for the current event to the atom's list
+
+                # Store the statistics of the event
                 collision_stats[category][atom_index].append({'event_index': event_index,
                                                               'lifetime_ps': lifetime,
                                                               'num_atoms_involved': num_atoms_involved,
                                                               'avg_num_atoms': avg_num_atoms,
                                                               'avg_main_partner_distance': avg_main_partner_distance})
-                
-                # Iterate over each row in the event DataFrame to track
-                # connected clusters over time.
+
+                # Merge the atoms of each frame of the event into the connected clusters of that frame
                 for row in event_df.itertuples():
                     frame = row.frame
-
-                    # Build the atom set present in this event row.
                     cluster_atoms = set([atom_index] + list(row.atoms2))
-
-                    # Merge this atom set into the connected clusters already
-                    # seen for the same frame.
                     if frame not in cluster_set[category]:
                         cluster_set[category][frame] = []
-                    cluster_set[category][frame] = merge_frame_cluster(
-                        cluster_set[category][frame],
-                        cluster_atoms
-                    )
+                    cluster_set[category][frame] = merge_frame_cluster(cluster_set[category][frame],
+                                                                       cluster_atoms)
 
-    # Count unique clusters per frame for each category
+    # Number of connected clusters in each frame for each category
     for category, clusters in cluster_set.items():
         for frame, clusters_in_frame in clusters.items():
             cluster_counts[category][frame] = len(clusters_in_frame)
 
-    # Return the dictionary containing collision statistics and cluster counts
-    return collision_stats, cluster_counts
+    # Return without the cluster births and deaths unless they are requested
+    if not return_cluster_changes:
+        return collision_stats, cluster_counts
 
-def combine_collision_statistics(collision_statistics_results):
+    # Births and deaths of the clusters of each category in each frame
+    cluster_changes = {category: {'births': np.zeros(total_frames, dtype=int),
+                                  'deaths': np.zeros(total_frames, dtype=int)}
+                       for category in categorized_events}
+    for category, clusters in cluster_set.items():
+        for frame in range(1, total_frames):
+
+            # Clusters of the previous and the current frame and the atoms in them
+            previous_clusters = clusters.get(frame - 1, [])
+            current_clusters = clusters.get(frame, [])
+            if not previous_clusters and not current_clusters:
+                continue
+            previous_atoms = set().union(*previous_clusters)
+            current_atoms = set().union(*current_clusters)
+
+            # Clusters with no atom in a cluster of the other frame
+            cluster_changes[category]['births'][frame] = sum(1 for cluster in current_clusters
+                                                             if not cluster & previous_atoms)
+            cluster_changes[category]['deaths'][frame] = sum(1 for cluster in previous_clusters
+                                                             if not cluster & current_atoms)
+
+    return collision_stats, cluster_counts, cluster_changes
+
+
+def combine_collision_statistics(collision_statistics_results: list) -> tuple[dict, dict]:
     """
-    Combine multiple outputs of collision_statistics() in chronological order.
+    Combine several outputs of collision_statistics() from consecutive trajectory segments.
 
-    Inputs:
-    - collision_statistics_results: tuple-like
-        Iterable of tuples returned by collision_statistics(). Each tuple must
-        contain:
-        - collision_stats: dict
-            Nested dictionary of per-event statistics.
-        - cluster_counts: dict
-            Dictionary of per-frame cluster-count arrays.
-        The first tuple is used as the structural reference. All following
-        tuples are assumed to continue the trajectory in chronological order.
+    The event statistics are concatenated per category and reference atom, and the event indices are
+    renumbered consecutively. The cluster-count arrays are concatenated in time.
 
-    Returns:
-    - combined_collision_stats: dict
-        Combined collision statistics with the same nested structure as one
-        collision_statistics() output. Event indices are reassigned so that
-        they remain consecutive within each atom and category after merging.
-    - combined_cluster_counts: dict
-        Dictionary of concatenated cluster-count arrays for each category.
+    Usage: ``combined_stats, combined_counts = combine_collision_statistics([(stats1, counts1), (stats2, counts2)])``
+
+    Parameters
+    ----------
+    collision_statistics_results : list of tuple
+        Outputs (collision_stats, cluster_counts) of collision_statistics() in chronological order. The first
+        output defines the categories.
+
+    Returns
+    -------
+    combined_collision_stats : dict
+        Combined event statistics with the same nested structure as a single output of collision_statistics().
+    combined_cluster_counts : dict
+        Category mapped to the concatenated cluster-count array.
+
+    Raises
+    ------
+    ValueError
+        Raised if no outputs are given, or if a later output contains a category missing from the first one or
+        lacks one of its categories.
     """
-    # Require at least one result tuple to define the reference structure.
+
+    # Require at least one output to define the categories
     if not collision_statistics_results:
         raise ValueError('collision_statistics_results must contain at least one result.')
 
-    # Use the first result as the structural reference for categories and atoms.
+    # Use the first output as the reference structure
     reference_collision_stats, reference_cluster_counts = collision_statistics_results[0]
 
-    # Initialize the combined statistics by copying the reference structure.
+    # Copy the event statistics of the first output
     combined_collision_stats = {}
     for category, atoms_dict in reference_collision_stats.items():
         combined_collision_stats[category] = {}
@@ -877,15 +998,14 @@ def combine_collision_statistics(collision_statistics_results):
             combined_collision_stats[category][atom_index] = [dict(event_stats)
                                                               for event_stats in stats_list]
 
-    # Initialize concatenated cluster counts from the reference arrays.
+    # Copy the cluster counts of the first output
     combined_cluster_counts = {category: np.array(counts, copy=True)
                                for category, counts in reference_cluster_counts.items()}
 
-    # Append all following result tuples in chronological order.
+    # Append the following outputs in chronological order
     for collision_stats, cluster_counts in collision_statistics_results[1:]:
 
-        # Extend the event statistics for each category and include any new
-        # atom keys that appear only in later trajectory pieces.
+        # Extend the event statistics of each category, including reference atoms that appear only later
         for category, next_atoms_dict in collision_stats.items():
             if category not in combined_collision_stats:
                 raise ValueError(f"Missing collision_stats category '{category}' in reference result.")
@@ -894,16 +1014,16 @@ def combine_collision_statistics(collision_statistics_results):
                 if atom_index not in combined_collision_stats[category]:
                     combined_collision_stats[category][atom_index] = []
 
+                # Append the events with consecutive event indices
                 combined_stats_list = combined_collision_stats[category][atom_index]
                 next_event_index = len(combined_stats_list)
-
                 for event_stats in next_stats_list:
                     merged_event_stats = dict(event_stats)
                     merged_event_stats['event_index'] = next_event_index
                     combined_stats_list.append(merged_event_stats)
                     next_event_index += 1
 
-        # Concatenate the per-category cluster-count time series.
+        # Concatenate the cluster counts of each category
         for category, combined_counts in combined_cluster_counts.items():
             next_counts = cluster_counts.get(category)
             if next_counts is None:
@@ -913,229 +1033,284 @@ def combine_collision_statistics(collision_statistics_results):
 
     return combined_collision_stats, combined_cluster_counts
 
-def collision_counts(collision_stats):
-    """
-    Calculate the total number of collisions of each category over the entire trajectory.
 
-    Inputs:
-    - collision_stats: dict
-        A dictionary with the same keys as categorized_events, where each value is a dictionary
-        where keys are atom indices from group1 and values are lists of dictionaries
-        containing statistics for each event.
-
-    Returns:
-    - collision_counts: dict
-        A dictionary with the same keys as collision_stats, where each value is the total number 
-        of collisions for the corresponding category.
+def collision_counts(collision_stats: dict) -> dict:
     """
-    return {category: sum(len(stats) for stats in atoms_dict.values()) 
+    Count the events of each category.
+
+    Usage: ``counts = collision_counts(collision_stats)``
+
+    Parameters
+    ----------
+    collision_stats : dict
+        Output of collision_statistics() or combine_collision_statistics().
+
+    Returns
+    -------
+    collision_counts : dict
+        Category mapped to the total number of events.
+    """
+
+    # Number of events summed over the reference atoms of each category
+    return {category: sum(len(stats) for stats in atoms_dict.values())
             for category, atoms_dict in collision_stats.items()}
 
-def collision_counts_by_lifetime(collision_stats, lifetime_ranges):
-    """
-    Calculate the number of collisions per category for given lifetime ranges.
 
-    Inputs:
-    - collision_stats: dict
-        A dictionary with the same keys as categorized_events, where each value is a dictionary
-        where keys are atom indices from group1 and values are lists of dictionaries
-        containing statistics for each event including 'lifetime_ps'.
-    - lifetime_ranges: list of tuples
-        A list of tuples defining the lifetime ranges in picoseconds. 
-        Each tuple should be in the form (min_lifetime, max_lifetime),
-        both in picoseconds. 
-
-    Returns:
-    - counts_by_lifetime: dict
-        A dictionary with the same keys as collision_stats, where each value 
-        is a list of counts corresponding to the defined lifetime ranges.
+def collision_counts_by_lifetime(collision_stats: dict,
+                                 lifetime_ranges: list[tuple[float, float]]) -> dict:
     """
-    # Initialize one counter per lifetime range for each collision category
+    Count the events of each category in given lifetime ranges.
+
+    An event is counted in the first range for which min_lifetime <= lifetime < max_lifetime.
+
+    Usage: ``counts = collision_counts_by_lifetime(collision_stats, [(0, 1), (1, 3), (3, np.inf)])``
+
+    Parameters
+    ----------
+    collision_stats : dict
+        Output of collision_statistics() or combine_collision_statistics().
+    lifetime_ranges : list of tuple
+        Lifetime ranges (min_lifetime, max_lifetime) in ps.
+
+    Returns
+    -------
+    counts_by_lifetime : dict
+        Category mapped to a list of event counts, one per lifetime range.
+    """
+
+    # One counter per lifetime range for each category
     counts_by_lifetime = {category: [0] * len(lifetime_ranges) for category in collision_stats}
 
-    # Loop over all categories and their recorded collision events
+    # Go through all events of all categories
     for category, atoms_dict in collision_stats.items():
         for atom_index, stats_list in atoms_dict.items():
             for event in stats_list:
                 lifetime = event['lifetime_ps']
 
-                # Assign the event to the first matching lifetime interval
+                # Count the event in the first matching lifetime range
                 for i, (min_lifetime, max_lifetime) in enumerate(lifetime_ranges):
                     if min_lifetime <= lifetime < max_lifetime:
                         counts_by_lifetime[category][i] += 1
-                        break  # Stop after the first matching range
+                        break
 
     return counts_by_lifetime
 
-def cluster_formation_equilibrium_values(cluster_counts,
-                                        collision_stats,
-                                        total_monomers,
-                                        volume=None):
-    """
-    Calculates the equilibrium constants and fractions for cluster formation.
 
-    Inputs:
-    - cluster_counts: dict
-        A dictionary with the same keys as categorized_events, where each value is an array of length total_frames.
-        Each element in the array represents the number of clusters at that frame for the corresponding category.
-    - collision_stats: dict
-        A dictionary with the same keys as categorized_events, where each
-        value is a dictionary keyed by atom index and each entry is a list of
-        event statistics. The field 'avg_num_atoms' is used to estimate the
-        average number of monomers in a cluster for each category.
-    - total_monomers: int
-        The total number of monomers in the system.
-    - volume: float, optional
-        The system volume. If provided, the equilibrium constant is multiplied by the volume. Default is None.
-
-    Returns:
-    - equilibrium_constants: dict
-        A dictionary with the same keys as cluster_counts, where each value is the calculated equilibrium 
-        constant for cluster formation in that category.
-    - equilibrium_fractions: dict
-        A dictionary with the same keys as cluster_counts, where each value is the fraction of monomers
-        involved in clusters of that category relative to the total number of monomers.
+def cluster_formation_equilibrium_values(cluster_counts: dict,
+                                         collision_stats: dict,
+                                         total_monomers: int,
+                                         volume: float | None=None,
+                                         free_monomers: float | None=None) -> tuple[dict, dict]:
     """
+    Calculate the equilibrium constants and the cluster fractions of the event categories.
+
+    The equilibrium constant of category c is
+
+    .. math::
+
+        K_c = \\frac{\\langle N_c \\rangle}{\\langle N_\\mathrm{mon} \\rangle^2} V,
+
+    where N_c is the number of clusters of the category and N_mon the number of monomers, i.e., atoms in no
+    event. The number of atoms in the clusters of a category is estimated as the mean number of clusters times
+    the mean number of atoms per frame of its events. The mean number of monomers should be given as
+    free_monomers, e.g. from the atom-time fractions as f_0 N (see atom_time_fractions()), which is exact.
+    Otherwise it is estimated as the atoms not counted in any cluster, which is approximate because the mean
+    cluster sizes are not time-weighted and a pair can belong to clusters of two categories.
+
+    Usage: ``K, fractions = cluster_formation_equilibrium_values(cluster_counts, collision_stats, N, volume=V)``
+
+    Parameters
+    ----------
+    cluster_counts : dict
+        Category mapped to the number of clusters in each frame, from collision_statistics().
+    collision_stats : dict
+        Output of collision_statistics(). The field 'avg_num_atoms' gives the mean cluster size of each
+        category.
+    total_monomers : int
+        Total number of atoms in the system.
+    volume : float, default=None
+        Volume of the system. If given, the equilibrium constants are multiplied by it.
+    free_monomers : float, default=None
+        Mean number of monomers. If None, it is estimated from the cluster counts and sizes.
+
+    Returns
+    -------
+    equilibrium_constants : dict
+        Category mapped to the equilibrium constant, in units of volume if the volume is given.
+    equilibrium_fractions : dict
+        Category mapped to the fraction of all atoms in its clusters, plus the key 'free_monomers' for the
+        fraction of monomers.
+    """
+
+    # Equilibrium constants and fractions of each category
     equilibrium_constants = {}
     equilibrium_fractions = {}
 
-    # Calculate the average number of atoms per cluster for each category
-    # from the collision statistics.
+    # Mean number of atoms per frame of the events of each category
     avg_cluster_sizes = {}
     for category in cluster_counts:
         category_event_stats = [event_stat
                                 for atom_stats in collision_stats.get(category, {}).values()
                                 for event_stat in atom_stats]
-
         if category_event_stats:
             avg_cluster_sizes[category] = np.mean([event_stat['avg_num_atoms']
                                                    for event_stat in category_event_stats])
         else:
             avg_cluster_sizes[category] = 0.0
-    
-    # Calculate total monomers bound across all categories
+
+    # Mean number of atoms in the clusters of all categories
     total_bound_monomers = 0
     for category, counts in cluster_counts.items():
         avg_num_clusters = np.mean(counts)
         avg_bound_monomers = avg_num_clusters * avg_cluster_sizes[category]
         total_bound_monomers += avg_bound_monomers
-    
-    # Calculate free monomers once for all categories
-    avg_free_monomers = total_monomers - total_bound_monomers
-    
-    # Now calculate equilibrium constants for each category
+
+    # Mean number of monomers, given or estimated as the atoms not counted in any cluster
+    if free_monomers is not None:
+        avg_free_monomers = free_monomers
+    else:
+        avg_free_monomers = total_monomers - total_bound_monomers
+
+    # Equilibrium constant and cluster fraction of each category
     for category, counts in cluster_counts.items():
         avg_num_clusters = np.mean(counts)
-        
-        # Calculate number of monomer pairs using K_eq = [Dimer] / [Monomer]^2
-        avg_free_monomer_pairs = avg_free_monomers**2
 
-        # Avoid division by zero
+        # Equilibrium constant K = [cluster] / [monomer]^2, infinite if there are no monomers
+        avg_free_monomer_pairs = avg_free_monomers**2
         if avg_free_monomer_pairs > 0:
             equilibrium_constant = avg_num_clusters / avg_free_monomer_pairs
         else:
-            equilibrium_constant = np.inf  # Infinite equilibrium constant if no monomer pairs are present
-        
-        # Multiply by volume if provided
+            equilibrium_constant = np.inf
+
+        # Convert the ratio of numbers into the ratio of concentrations
         if volume is not None:
             equilibrium_constant *= volume
-        
         equilibrium_constants[category] = equilibrium_constant
-        
-        # Calculate bound monomers for this category
+
+        # Fraction of all atoms in the clusters of this category
         avg_bound_monomers = avg_num_clusters * avg_cluster_sizes[category]
         equilibrium_fractions[category] = avg_bound_monomers / total_monomers if total_monomers > 0 else 0
 
-    # Calculate the fraction of free monomers
+    # Fraction of monomers
     equilibrium_fractions['free_monomers'] = avg_free_monomers / total_monomers if total_monomers > 0 else 0
 
     return equilibrium_constants, equilibrium_fractions
 
-def cluster_formation_rates(cluster_counts, 
-                            dt,
-                            volume=None):
-    """
-    Compute cluster formation and break-up rates from cluster counts over time.
 
-    Inputs:
-    - cluster_counts: dict
-        A dictionary with the same keys as categorized_events, where each value is an array of length total_frames.
-        Each element in the array represents the number of clusters at that frame for the corresponding category.
-    - dt: float
-        The time step between frames in seconds.
-    - volume: float, optional
-        The system volume in cubic Ångströms. If provided, rates are normalized by volume
-        and returned in units of 1/(s*cm^3). Default is None.
-
-    Returns:
-    - rates: dict
-        A dictionary with the same keys as cluster_counts, where each value is a dictionary containing:
-        - 'formation_rate': The average rate of cluster formation (clusters per second, or 1/(s*cm^3) if volume is provided).
-        - 'breakup_rate': The average rate of cluster break-up (clusters per second, or 1/(s*cm^3) if volume is provided).
+def cluster_formation_rates(cluster_counts: dict,
+                            dt: float,
+                            volume: float | None=None,
+                            cluster_changes: dict | None=None) -> dict:
     """
+    Calculate the formation and break-up rates of the clusters of each category.
+
+    If the cluster births and deaths of collision_statistics() are given, the formations (break-ups) are their
+    total numbers. Otherwise, they are estimated as the sum of the positive (negative) changes of the cluster
+    count between consecutive frames. This estimate misses formations and break-ups that coincide in the same
+    frame, and therefore underestimates the rates of frequent events (by about 9 % for two-body scattering in
+    Xe gas at 1 atm with 50 fs frames). The numbers are divided by the time spanned by the frames,
+    (N_frames - 1) dt.
+
+    Usage: ``rates = cluster_formation_rates(cluster_counts, dt, volume=V, cluster_changes=cluster_changes)``
+
+    Parameters
+    ----------
+    cluster_counts : dict
+        Category mapped to the number of clusters in each frame, from collision_statistics().
+    dt : float
+        Time step between frames in seconds.
+    volume : float, default=None
+        Volume of the system in Å^3. If given, the rates are divided by the volume and given in s^-1 cm^-3.
+    cluster_changes : dict, default=None
+        Cluster births and deaths in each frame, the third output of collision_statistics() with
+        return_cluster_changes=True.
+
+    Returns
+    -------
+    rates : dict
+        Category mapped to a dictionary with the keys 'formation_rate' and 'breakup_rate', in s^-1, or in
+        s^-1 cm^-3 if the volume is given.
+    """
+
+    # Rates of each category
     rates = {}
-    
-    # Conversion factor from Ångströms^3 to cm^3
+
+    # Volume in cm^3
     angstrom_to_cm = 1e-8
     volume_cm3 = volume * (angstrom_to_cm ** 3) if volume is not None else None
-    
+
+    # Go through the categories
     for category, counts in cluster_counts.items():
-        # Calculate the difference in cluster counts between consecutive frames
-        count_diff = np.diff(counts)
-        
-        # Calculate formation and break-up events by summing the positive and negative changes
-        formations = np.sum(count_diff[count_diff > 0])  # Sum of positive changes as formations
-        breakups = -np.sum(count_diff[count_diff < 0])   # Sum of negative changes as break-ups (negate to get positive count)
-        
-        # Calculate total time in seconds
-        total_time = len(counts) * dt
-        
-        # Calculate rates
+
+        # Formations and break-ups as the total numbers of cluster births and deaths
+        if cluster_changes is not None:
+            formations = np.sum(cluster_changes[category]['births'])
+            breakups = np.sum(cluster_changes[category]['deaths'])
+
+        # Otherwise as the sums of the positive and negative changes of the cluster count between frames
+        else:
+            count_diff = np.diff(counts)
+            formations = np.sum(count_diff[count_diff > 0])
+            breakups = -np.sum(count_diff[count_diff < 0])
+
+        # Time spanned by the frames in seconds
+        total_time = (len(counts) - 1) * dt
+
+        # Rates per unit time
         formation_rate = formations / total_time if total_time > 0 else 0
         breakup_rate = breakups / total_time if total_time > 0 else 0
-        
-        # Normalize by volume if provided
+
+        # Rates per unit volume if the volume is given
         if volume_cm3 is not None:
             formation_rate /= volume_cm3
             breakup_rate /= volume_cm3
-        
+
         rates[category] = {'formation_rate': formation_rate,
                            'breakup_rate': breakup_rate}
 
     return rates
 
-def atom_time_fractions(collision_stats,
-                        n_atoms,
-                        total_frames,
-                        dt):
+
+def atom_time_fractions(collision_stats: dict,
+                        n_atoms: int,
+                        total_frames: int,
+                        dt: float) -> dict:
     """
-    Calculate the fraction of the total atom-time spent as a reference atom in events of each category.
+    Calculate the fraction of the total atom-time spent by the reference atoms in events of each category.
 
-    Each frame of a reference atom belongs to at most one of its events, so these fractions and the
-    remaining fraction of free atoms sum to unity. Together with time-weighted category averages
-    (see average_property_R_time_weighted()), they decompose the trajectory average of a single-atom
-    property exactly: <A> = sum_c f_c <A_c>.
+    Each frame of a reference atom belongs to at most one of its events, so these fractions and the remaining
+    fraction of free atoms sum to unity. Together with the time-weighted category averages of
+    average_property_R_time_weighted(), they decompose the trajectory average of a single-atom property exactly:
 
-    Inputs:
-    - collision_stats: dict
-        Output of collision_statistics() or combine_collision_statistics(). The field 'lifetime_ps'
-        of each event is used.
-    - n_atoms: int
+    .. math::
+
+        \\langle A \\rangle = \\sum_c f_c \\langle A_c \\rangle.
+
+    Usage: ``time_fractions = atom_time_fractions(collision_stats, n_atoms, total_frames, dt)``
+
+    Parameters
+    ----------
+    collision_stats : dict
+        Output of collision_statistics() or combine_collision_statistics(). The field 'lifetime_ps' of each
+        event is used.
+    n_atoms : int
         Number of reference atoms.
-    - total_frames: int
+    total_frames : int
         Total number of frames in the trajectory.
-    - dt: float
+    dt : float
         Time step between frames in seconds.
 
-    Returns:
-    - time_fractions: dict
-        A dictionary with the same category keys as collision_stats, plus the key 'free_monomers',
-        where each value is the fraction of the total atom-time.
+    Returns
+    -------
+    time_fractions : dict
+        Category mapped to its fraction of the total atom-time, plus the key 'free_monomers' for the fraction
+        spent outside any event.
     """
-    # Total atom-time of the trajectory in picoseconds
+
+    # Total atom-time of the trajectory in ps
     total_atom_time_ps = n_atoms * total_frames * dt * 1e12
 
-    # Sum the event lifetimes of each category and normalise by the total atom-time
+    # Summed event lifetimes of each category normalised by the total atom-time
     time_fractions = {}
     for category, atoms_dict in collision_stats.items():
         category_time_ps = sum(event['lifetime_ps'] for stats_list in atoms_dict.values() for event in stats_list)
@@ -1146,217 +1321,217 @@ def atom_time_fractions(collision_stats,
 
     return time_fractions
 
-##############################################################################################################
+
+###################################################################################################################
 # Trajectory analysis functions using categorized events
-##############################################################################################################
-def property_time_series(u, 
-                         categorized_collisions, 
-                         category, 
-                         atom_index, 
-                         event_index, 
-                         property_function, 
-                         *args):
+###################################################################################################################
+def property_time_series(u: mda.Universe,
+                         categorized_collisions: dict,
+                         category: str,
+                         atom_index: int,
+                         event_index: int,
+                         property_function: Callable,
+                         *args) -> np.ndarray:
     """
-    Calculate a time series of a given property for a specific collision event.
+    Calculate the time series of a property of the main pair of a collision event from the trajectory.
 
-    Inputs:
-    - u: MDAnalysis Universe
-        The MDAnalysis Universe object containing the trajectory and topology.
-    - categorized_collisions: dict
-        A dictionary with four keys: 'two_body_scattering', 'multi_body_scattering', 'perturbed_scattering', 'vdw'.
-        Each key maps to a dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of pandas DataFrames representing the categorized collisions.
-    - category: str
-        The category of the collision event (e.g., 'two_body_scattering').
-    - atom_index: int
-        The index of the atom from group1 involved in the collision event.
-    - event_index: int
-        The index of the specific event for the given atom in the specified category.
-    - property_function: function
-        A function that takes two MDAnalysis AtomGroups and additional arguments to calculate the desired property.
-    - *args: additional arguments to be passed to the property_function.
+    In each frame of the event, the reference atom is centred in the box and all atoms are wrapped, after which
+    the property function is evaluated for the reference atom and the main partner.
 
-    Returns:
-    - time_series: numpy array
-        An array of property values for each frame in the specified collision event.
+    Usage: ``series = property_time_series(u, categorized, 'vdw', atom_index, event_index, angular_momentum)``
+
+    Parameters
+    ----------
+    u : Universe
+        MDAnalysis Universe containing the trajectory and topology.
+    categorized_collisions : dict
+        Output of categorize_collisions().
+    category : str
+        Category of the event, e.g. 'two_body_scattering'.
+    atom_index : int
+        Atom index of the reference atom.
+    event_index : int
+        Index of the event in the event list of the reference atom in the category.
+    property_function : callable
+        Function of two AtomGroups and the additional arguments that returns the property.
+    *args
+        Additional arguments passed to property_function.
+
+    Returns
+    -------
+    time_series : ndarray
+        Property value in each frame of the event.
     """
-    # Retrieve the event DataFrame for the specified category, atom index, and event index
+
+    # Event and its main partner
     event_df = categorized_collisions[category][atom_index][event_index]
-
-    # Identify the main partner atom index 
     main_partner_idx = main_partner_index(event_df)
 
-    # Initialize a list to store the property values for each frame in the event
+    # Property value in each frame of the event
     time_series = []
-
-    # Iterate over each row in the event DataFrame to calculate the property for each frame
     for row in event_df.itertuples():
         frame = row.frame
-        
-        # Set the trajectory to the current frame
+
+        # Move the trajectory to the current frame
         u.trajectory[frame]
-                
-        # Create AtomGroups for the current frame
+
+        # AtomGroups of the reference atom and the main partner
         atom_group1 = u.atoms[[atom_index]]
         atom_group2 = u.atoms[[main_partner_idx]]
 
-        # Apply center and wrap transformation
+        # Centre the reference atom and wrap all atoms into the box
         center_and_wrap(u, u.trajectory.ts, atom_group1)
-        
-        # Calculate the property using the provided function and additional arguments
+
+        # Evaluate the property
         property_value = property_function(atom_group1, atom_group2, *args)
-        
-        # Append the calculated property value to the time series list
         time_series.append(property_value)
-    
+
     return np.array(time_series)
 
-def property_R_main_partner_time_series(categorized_collisions,
-                                       category,
-                                       atom_index,
-                                       event_index,
-                                       property_function,
-                                       *args):
-    """
-    Calculate a time series of a given property that depends only on the distance between the main
-    colliding partners for a specific collision event.
 
-    Inputs:
-    - categorized_collisions: dict
-        A dictionary with four keys: 'two_body_scattering', 'multi_body_scattering', 'perturbed_scattering', 'vdw'.
-        Each key maps to a dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of pandas DataFrames representing the categorized collisions.
-    - category: str
-        The category of the collision event (e.g., 'two_body_scattering').
-    - atom_index: int
-        The index of the atom from group1 involved in the collision event.
-    - event_index: int
-        The index of the specific event for the given atom in the specified category.
-    - property_function: function
-        A function that takes a distance array and additional arguments to calculate the desired property.
-    - *args: additional arguments to be passed to the property_function.
-
-    Returns:
-    - time_series: numpy array
-        An array of property values for each frame in the specified collision event (main partner).
+def property_R_main_partner_time_series(categorized_collisions: dict,
+                                        category: str,
+                                        atom_index: int,
+                                        event_index: int,
+                                        property_function: Callable,
+                                        *args) -> np.ndarray:
     """
-    # Retrieve the event DataFrame for the specified category, atom index, and event index
+    Calculate the time series of a distance-dependent property of the main pair of a collision event.
+
+    Usage: ``series = property_R_main_partner_time_series(categorized, 'vdw', atom_index, event_index, A_of_R)``
+
+    Parameters
+    ----------
+    categorized_collisions : dict
+        Output of categorize_collisions().
+    category : str
+        Category of the event, e.g. 'two_body_scattering'.
+    atom_index : int
+        Atom index of the reference atom.
+    event_index : int
+        Index of the event in the event list of the reference atom in the category.
+    property_function : callable
+        Function of a distance array in Å and the additional arguments that returns the property.
+    *args
+        Additional arguments passed to property_function.
+
+    Returns
+    -------
+    time_series : ndarray
+        Property value of the main pair in each frame of the event.
+    """
+
+    # Event of the reference atom
     event_df = categorized_collisions[category][atom_index][event_index]
 
-    # Extract the distance series for the main colliding partner using the helper function
+    # Distance series of the main pair
     main_partner_distances = main_partner_distance_series(event_df)
 
-    # Calculate the property for each frame in the event using the provided function and additional arguments
+    # Property in each frame of the event
     time_series = property_function(main_partner_distances, *args)
 
     return np.array(time_series)
 
-def property_R_all_partners_time_series(categorized_collisions,
-                                        category,
-                                        atom_index,
-                                        event_index,
-                                        property_function,
+
+def property_R_all_partners_time_series(categorized_collisions: dict,
+                                        category: str,
+                                        atom_index: int,
+                                        event_index: int,
+                                        property_function: Callable,
                                         *args,
-                                        use_pairwise_sum=False):
+                                        use_pairwise_sum: bool=False) -> dict | tuple[dict, np.ndarray]:
     """
-    Calculate a time series of a given property for all partners in a specific collision event,
-    where the property depends only on the distance between the atoms.
+    Calculate the time series of a distance-dependent property for each partner of a collision event.
 
-    Inputs:
-    - categorized_collisions: dict
-        A dictionary with four keys: 'two_body_scattering', 'multi_body_scattering', 'perturbed_scattering', 'vdw'.
-        Each key maps to a dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of pandas DataFrames representing the categorized collisions.
-    - category: str
-        The category of the collision event (e.g., 'two_body_scattering').
-    - atom_index: int
-        The index of the atom from group1 involved in the collision event.
-    - event_index: int
-        The index of the specific event for the given atom in the specified category.
-    - property_function: function
-        A function that takes a distance array and additional arguments to calculate the desired property.
-    - *args: additional arguments to be passed to the property_function.
-    - use_pairwise_sum: bool
-        If True, also return the pairwise additive contribution (sum of all partners). Default is False.
+    Usage: ``series, pairwise_sum = property_R_all_partners_time_series(categorized, 'vdw', atom_index,
+    event_index, A_of_R, use_pairwise_sum=True)``
 
-    Returns:
-    - time_series: dict
-        A dict of arrays for each partner, with property values for each frame in the specified collision event.
-    - pairwise_sum: numpy array (only if use_pairwise_sum=True)
-        Sum of property values from all partners for each frame.
+    Parameters
+    ----------
+    categorized_collisions : dict
+        Output of categorize_collisions().
+    category : str
+        Category of the event, e.g. 'two_body_scattering'.
+    atom_index : int
+        Atom index of the reference atom.
+    event_index : int
+        Index of the event in the event list of the reference atom in the category.
+    property_function : callable
+        Function of a distance array in Å and the additional arguments that returns the property.
+    *args
+        Additional arguments passed to property_function.
+    use_pairwise_sum : bool, default=False
+        If True, also return the sum of the property over all partners in each frame (pairwise additivity).
+
+    Returns
+    -------
+    time_series : dict
+        Atom index of each partner mapped to the property in each frame of the event. The value is NaN in the
+        frames where the partner is absent.
+    pairwise_sum : ndarray
+        Sum of the property over all partners present in each frame. Returned only if use_pairwise_sum is True.
     """
-    # Retrieve the event DataFrame for the specified category, atom index, and event index
+
+    # Event of the reference atom
     event_df = categorized_collisions[category][atom_index][event_index]
 
-    # Extract the distance series for all partners
+    # Distance series of each partner
     partner_distances = distance_series(event_df)
-    
-    # Compute the property for each partner's distance series
+
+    # Property series of each partner
     time_series = {partner: property_function(distances, *args)
                    for partner, distances in partner_distances.items()}
-    
-    # If requested, compute the pairwise sum of contributions from all partners
+
+    # Sum over the partners present in each frame, ignoring the NaN values of absent partners
     if use_pairwise_sum:
-        # Sum contributions from all partners, handling NaN values
         pairwise_sum = np.nansum(list(time_series.values()), axis=0)
         return time_series, pairwise_sum
-    
+
     return time_series
 
-def average_property_R_per_event(categorized_collisions,
-                                 property_function,
+
+def average_property_R_per_event(categorized_collisions: dict,
+                                 property_function: Callable,
                                  *args,
-                                 use_pairwise_sum=False):
+                                 use_pairwise_sum: bool=False) -> dict:
     """
-    Calculate the average value of a distance-dependent property for each
-    individual collision event.
+    Calculate the average of a distance-dependent property over each collision event.
 
-    Inputs:
-    - categorized_collisions: dict
-        A dictionary with four keys: 'two_body_scattering',
-        'multi_body_scattering', 'perturbed_scattering', and 'vdw'.
-        Each key maps to a dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of pandas DataFrames representing the
-          categorized collisions.
-    - property_function: function
-        A function that takes a distance array R and additional arguments to
-        calculate the desired property. The property must depend only on the
-        distance R between atoms.
-    - *args: additional arguments to be passed to the property_function.
-    - use_pairwise_sum: bool
-        If True, uses pairwise sum of all partners. If False (default), uses
-        only the main partner distances.
+    Usage: ``event_averages = average_property_R_per_event(categorized, A_of_R, use_pairwise_sum=True)``
 
-    Returns:
-    - event_average_properties: dict
-        A dictionary with the same category and atom-index structure as
-        categorized_collisions. Each event is represented by a dictionary
-        containing:
-        - 'average_property': The average value of the property over all
-          distances R in that collision event.
+    Parameters
+    ----------
+    categorized_collisions : dict
+        Output of categorize_collisions().
+    property_function : callable
+        Function of a distance array in Å and the additional arguments that returns the property.
+    *args
+        Additional arguments passed to property_function.
+    use_pairwise_sum : bool, default=False
+        If True, the property of a frame is the sum over all partners. If False, only the main partner is used.
+
+    Returns
+    -------
+    event_average_properties : dict
+        Same nested structure as categorized_collisions, with each event replaced by a dictionary with the key
+        'average_property', the mean of the property over the frames of the event.
     """
-    # Initialise a nested dictionary to match the categorized collision
-    # structure.
+
+    # Nested structure of the per-event averages
     event_average_properties = {category: {atom_index: [] for atom_index in categorized_collisions[category]}
                                 for category in categorized_collisions}
 
-    # Process one category at a time using the same tqdm pattern as the other
-    # analysis functions.
+    # Go through the categories
     for category in categorized_collisions:
 
-        # Process each atom in the current category with a category-specific
-        # progress bar.
+        # Go through the reference atoms of the category
         for atom_index in tqdm(categorized_collisions[category],
                                desc=f'Calculating average collision properties for {category}'):
 
-            # Iterate through each collision event for the current atom.
+            # Go through the events of the reference atom
             for event_index, _ in enumerate(categorized_collisions[category][atom_index]):
 
-                # Select the distance series definition requested by the user.
+                # Property series summed over all partners or of the main partner only
                 if use_pairwise_sum:
                     _, property_values = property_R_all_partners_time_series(categorized_collisions,
                                                                              category,
@@ -1373,38 +1548,39 @@ def average_property_R_per_event(categorized_collisions,
                                                                           property_function,
                                                                           *args)
 
-                # Compute the event-averaged property value.
+                # Mean of the property over the frames of the event
                 average_value = np.nanmean(property_values)
-
-                # Store the per-event result in the nested output structure.
                 event_average_properties[category][atom_index].append({'average_property': average_value})
 
     return event_average_properties
 
-def average_property_R_over_events(event_average_properties):
-    """
-    Average per-event property values over events for each atom.
 
-    Inputs:
-    - event_average_properties: dict
-        Output of average_property_R_per_event(). The dictionary is keyed by
-        category and atom index, and each value is a list of per-event result
-        dictionaries.
-
-    Returns:
-        - average_properties: dict
-                Each category value is a dictionary where each atom index maps to a dictionary containing:
-        - 'average_property': The average property over all events of that
-          atom in the category.
-        - 'total_num_events': The total number of events for that atom in the
-          category.
+def average_property_R_over_events(event_average_properties: dict) -> dict:
     """
-    # Build one event-level summary per atom within each category.
+    Average the per-event property averages over the events of each reference atom.
+
+    Every event has the same weight, regardless of its lifetime.
+
+    Usage: ``atom_averages = average_property_R_over_events(event_averages)``
+
+    Parameters
+    ----------
+    event_average_properties : dict
+        Output of average_property_R_per_event().
+
+    Returns
+    -------
+    average_properties : dict
+        Category mapped to a dictionary that maps the atom index of each reference atom to a dictionary with
+        the keys 'average_property' (mean over the events) and 'total_num_events' (number of events).
+    """
+
+    # Summaries of each category
     average_properties = {}
     for category, atoms_dict in event_average_properties.items():
         average_properties[category] = {}
 
-        # Summarise the event averages for each atom separately.
+        # Mean over the events of each reference atom
         for atom_index, atom_events in atoms_dict.items():
             if atom_events:
                 average_property_values = [event['average_property'] for event in atom_events]
@@ -1416,28 +1592,36 @@ def average_property_R_over_events(event_average_properties):
 
     return average_properties
 
-def average_property_R_over_atoms(average_properties_over_events):
-    """
-    Average per-atom property summaries over atoms within each category.
 
-    Inputs:
-    - average_properties_over_events: dict
-        Output of average_property_R_over_events(). Each category value is a
-        dictionary keyed by atom index and each atom value contains the
-        summary fields 'average_property' and 'total_num_events'.
-
-    Returns:
-    - average_properties: dict
-        Dictionary keyed by category, where each value is a category-level
-        summary averaged over all atoms with recorded events in that
-        category.
+def average_property_R_over_atoms(average_properties_over_events: dict) -> dict:
     """
+    Average the per-atom property averages over the reference atoms of each category.
+
+    Every reference atom with at least one event has the same weight.
+
+    Usage: ``category_averages = average_property_R_over_atoms(atom_averages)``
+
+    Parameters
+    ----------
+    average_properties_over_events : dict
+        Output of average_property_R_over_events().
+
+    Returns
+    -------
+    average_properties : dict
+        Category mapped to a dictionary with the keys 'average_property' (mean over the reference atoms) and
+        'total_num_events' (number of events in the category).
+    """
+
+    # Summaries of each category
     average_properties = {}
-
     for category, atoms_dict in average_properties_over_events.items():
+
+        # Reference atoms with at least one event
         atom_summaries = [summary for summary in atoms_dict.values()
                           if summary['total_num_events'] > 0]
 
+        # Mean over the reference atoms and the total number of events
         if atom_summaries:
             average_property_values = [summary['average_property']
                                        for summary in atom_summaries]
@@ -1451,226 +1635,248 @@ def average_property_R_over_atoms(average_properties_over_events):
 
     return average_properties
 
-def average_property_R(categorized_collisions,
-                       property_function,
+
+def average_property_R(categorized_collisions: dict,
+                       property_function: Callable,
                        *args,
-                       average_over_events=True,
-                       average_over_atoms=False,
-                       use_pairwise_sum=False):
+                       average_over_events: bool=True,
+                       average_over_atoms: bool=False,
+                       use_pairwise_sum: bool=False) -> dict:
     """
-    Calculate the average value of a given property that depends only on the
-    distance R for collision events across all categories.
+    Calculate the event-weighted averages of a distance-dependent property for each category.
 
-    This is a convenience wrapper that first computes per-event property
-    averages and then processes them further over events and, optionally,
-    over atoms.
+    The property is first averaged over each event (average_property_R_per_event()) and then, optionally, over
+    the events of each reference atom and over the reference atoms. Every event, and every reference atom, has
+    the same weight regardless of its lifetime. For averages consistent with the atom-time fractions, use
+    average_property_R_time_weighted() instead.
 
-    Inputs:
-    - categorized_collisions: dict
-        A dictionary with four keys: 'two_body_scattering',
-        'multi_body_scattering', 'perturbed_scattering', and 'vdw'.
-        Each key maps to a dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of pandas DataFrames representing the categorized
-          collisions.
-    - property_function: function
-        A function that takes a distance array R and additional arguments to
-        calculate the desired property. The property must depend only on the
-        distance R between atoms.
-    - *args: additional arguments to be passed to the property_function.
-    - average_over_events: bool
-        If True (default), returns the average property value over all events
-        in each category. If False, returns the average property value for
-        each individual collision event instead.
-    - average_over_atoms: bool
-        If True, also average over atoms within each category. This option
-        requires average_over_events=True, so averaging only over atoms is
-        not allowed.
-    - use_pairwise_sum: bool
-        If True, uses pairwise sum of all partners. If False (default), uses
-        only the main partner distances.
+    Usage: ``averages = average_property_R(categorized, A_of_R, average_over_atoms=True)``
 
-    Returns:
-    - average_properties: dict
-        The output of average_property_R_over_events() or, if
-        average_over_atoms=True, the output of average_property_R_over_atoms().
+    Parameters
+    ----------
+    categorized_collisions : dict
+        Output of categorize_collisions().
+    property_function : callable
+        Function of a distance array in Å and the additional arguments that returns the property.
+    *args
+        Additional arguments passed to property_function.
+    average_over_events : bool, default=True
+        If True, average over the events of each reference atom. If False, return the per-event averages.
+    average_over_atoms : bool, default=False
+        If True, also average over the reference atoms of each category. Requires average_over_events=True.
+    use_pairwise_sum : bool, default=False
+        If True, the property of a frame is the sum over all partners. If False, only the main partner is used.
+
+    Returns
+    -------
+    average_properties : dict
+        Output of average_property_R_per_event(), average_property_R_over_events() or
+        average_property_R_over_atoms(), depending on the averaging options.
     """
-    # Calculate the average property for each individual event first.
+
+    # Average over each event
     event_average_properties = average_property_R_per_event(categorized_collisions,
                                                             property_function,
                                                             *args,
                                                             use_pairwise_sum=use_pairwise_sum)
 
-    # Return the per-event values unchanged when no further averaging is requested.
+    # Return the per-event averages if no further averaging is requested
     if not average_over_events:
         return event_average_properties
 
-    # Average the event-level values for each atom.
+    # Average over the events of each reference atom
     average_properties = average_property_R_over_events(event_average_properties)
 
-    # Optionally average the atom-level summaries over atoms within a category.
+    # Optionally average over the reference atoms of each category
     if average_over_atoms:
         return average_property_R_over_atoms(average_properties)
 
     return average_properties
 
-def average_property_R_time_weighted(categorized_collisions,
-                                     property_function,
+
+def average_property_R_time_weighted(categorized_collisions: dict,
+                                     property_function: Callable,
                                      *args,
-                                     use_pairwise_sum=True,
-                                     n_jobs=1):
+                                     use_pairwise_sum: bool=True,
+                                     n_jobs: int=1) -> dict:
     """
     Calculate the time-weighted average of a distance-dependent property for each event category.
 
-    The property values of all frames of all events in a category are pooled, so that each event
-    contributes in proportion to its lifetime. This is the category average that is consistent with
-    the atom-time fractions of atom_time_fractions(), and the two together reproduce the trajectory
-    average of the property exactly.
+    The property values of all frames of all events in a category are pooled, so that each event contributes in
+    proportion to its lifetime. This is the category average that is consistent with the atom-time fractions of
+    atom_time_fractions(), and the two together reproduce the trajectory average of the property exactly.
 
-    Inputs:
-    - categorized_collisions: dict
-        A dictionary with four keys: 'two_body_scattering', 'multi_body_scattering',
-        'perturbed_scattering', and 'vdw'. Each key maps to a dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of pandas DataFrames representing the categorized collisions.
-    - property_function: function
-        A function that takes a distance array R and additional arguments and returns the property.
-        The property must depend only on R.
-    - *args: additional arguments to be passed to the property_function.
-    - use_pairwise_sum: bool
-        If True (default), the property of a frame is the sum over all partners within the cutoff
-        (pairwise additivity). If False, only the main partner is used.
-    - n_jobs: int
-        Number of CPUs for parallel processing over atoms. Default is 1.
+    Usage: ``averages = average_property_R_time_weighted(categorized, A_of_R, n_jobs=8)``
 
-    Returns:
-    - average_properties: dict
-        Dictionary keyed by category, where each value contains:
-        - 'average_property': The time-weighted average property of the category.
-        - 'total_num_events': The total number of events in the category.
-        - 'total_frames': The total number of frames of all events in the category.
-        - 'property_sum': The sum of the property over all frames, for pooling several trajectories.
+    Parameters
+    ----------
+    categorized_collisions : dict
+        Output of categorize_collisions().
+    property_function : callable
+        Function of a distance array in Å and the additional arguments that returns the property. It must return
+        NaN for NaN distances.
+    *args
+        Additional arguments passed to property_function.
+    use_pairwise_sum : bool, default=True
+        If True, the property of a frame is the sum over all partners within the cutoff (pairwise additivity).
+        If False, only the main partner is used.
+    n_jobs : int, default=1
+        Number of parallel processes over the reference atoms.
+
+    Returns
+    -------
+    average_properties : dict
+        Category mapped to a dictionary with the keys
+
+        - 'average_property': time-weighted average of the property in the category,
+        - 'total_num_events': number of events in the category,
+        - 'total_frames': number of frames of all events in the category, and
+        - 'property_sum': sum of the property over all these frames, for pooling several trajectories.
     """
-    # Helper function returning the frame sum of the property and the number of frames for the events of one atom.
-    # Only the event list of the atom is passed, so that parallel workers do not receive the whole dictionary.
-    def process_atom(events):
+
+    def process_atom(events: list) -> tuple[float, int, int]:
+        """
+        Sum the property over all frames of the events of one reference atom.
+
+        Only the event list is passed, so that the parallel workers do not receive the whole dictionary.
+
+        Parameters
+        ----------
+        events : list
+            Events of the reference atom as DataFrames.
+
+        Returns
+        -------
+        property_sum : float
+            Sum of the property over all frames of the events.
+        num_frames : int
+            Number of frames of the events.
+        num_events : int
+            Number of events.
+        """
+
+        # Accumulate the property sum and the number of frames over the events
         property_sum = 0.0
         num_frames = 0
         for event_df in events:
+
+            # Property of each partner in each frame, or of the main partner only
             if use_pairwise_sum:
                 partner_distances = distance_series(event_df)
                 property_values = [property_function(distances, *args) for distances in partner_distances.values()]
             else:
                 property_values = property_function(main_partner_distance_series(event_df), *args)
+
+            # Sum over the frames and partners, ignoring the NaN values of absent partners
             property_sum += np.nansum(property_values)
             num_frames += len(event_df)
+
         return property_sum, num_frames, len(events)
 
+    # Time-weighted average of each category
     average_properties = {}
     for category in categorized_collisions:
 
-        # Pool the frame sums of all atoms in the category
+        # Property sums of all reference atoms of the category in parallel
         results = Parallel(n_jobs=n_jobs)(delayed(process_atom)(events)
                                           for events in tqdm(categorized_collisions[category].values(),
                                                              desc=f'Time-weighted averages for {category}'))
+
+        # Pool the sums and frame counts of all reference atoms
         property_sum = sum(result[0] for result in results)
         total_frames = sum(result[1] for result in results)
         total_num_events = sum(result[2] for result in results)
 
         average_properties[category] = {'average_property': property_sum / total_frames if total_frames > 0
                                                             else np.nan,
-                                         'total_num_events': total_num_events,
-                                         'total_frames': total_frames,
-                                         'property_sum': property_sum}
+                                        'total_num_events': total_num_events,
+                                        'total_frames': total_frames,
+                                        'property_sum': property_sum}
 
     return average_properties
 
-def average_property_R_statistics(average_properties,
-                                  equilibrium_fractions,
-                                  collision_stats):
+
+def average_property_R_statistics(average_properties: dict,
+                                  equilibrium_fractions: dict,
+                                  collision_stats: dict) -> pd.DataFrame:
     """
-    Calculate category-level lifetime statistics and equilibrium-weighted
-    average contributions for distance-dependent properties.
+    Tabulate the event-weighted category averages of a property with lifetime statistics and their
+    contributions to the ensemble average.
 
-    This function assumes that average_property_R() was called with
-    average_over_events=True and average_over_atoms=True, so that each
-    category maps directly to a category-level summary.
+    The contribution of each category is its average property multiplied by its equilibrium fraction. The final
+    row 'all' gives the sum of the contributions and the average property of the events of all categories.
 
-    Inputs:
-    - average_properties: dict
-        Output of average_property_R() when both average_over_events and
-        average_over_atoms are True. Each category value must contain the
-        keys 'average_property' and 'total_num_events'.
-    - equilibrium_fractions: dict
-        Output of cluster_formation_equilibrium_values(). The category
-        fractions are used to weight the average property contributions.
-    - collision_stats: dict
-        Output of collision_statistics(). Used only to obtain event
-        lifetimes for the average lifetime statistics.
+    Usage: ``table = average_property_R_statistics(averages, fractions, collision_stats)``
 
-    Returns:
-    - property_statistics_df: pandas DataFrame
-        A DataFrame containing one row for each event category and one final
-        all row. The columns are:
-        - 'category': The event category label.
-        - 'average_property': The average property value for the category.
-        - 'total_num_events': The total number of events in the category.
-        - 'average_lifetime_ps': The average event lifetime in picoseconds.
-        - 'equilibrium_fraction': The equilibrium fraction assigned to the
-          category.
-        - 'weighted_average': The contribution of the category to the
-          ensemble average.
+    Parameters
+    ----------
+    average_properties : dict
+        Output of average_property_R() with average_over_events=True and average_over_atoms=True, so that each
+        category maps to a dictionary with the keys 'average_property' and 'total_num_events'.
+    equilibrium_fractions : dict
+        Output of cluster_formation_equilibrium_values(). The category fractions weight the contributions.
+    collision_stats : dict
+        Output of collision_statistics(), used for the event lifetimes.
+
+    Returns
+    -------
+    property_statistics_df : DataFrame
+        One row per category and a final row 'all', with the columns 'category', 'average_property',
+        'total_num_events', 'average_lifetime_ps', 'equilibrium_fraction' and 'weighted_average'. The
+        floating-point columns are formatted as strings in scientific notation.
     """
-    # Initialise a list of rows for the output table.
+
+    # Rows of the output table
     property_statistics_rows = []
 
-    # Calculate one set of summary statistics for each category.
+    # Summary statistics of each category
     for category, category_summary in average_properties.items():
+
+        # Event lifetimes and equilibrium fraction of the category
         category_collision_stats = collision_stats.get(category, {})
         event_lifetimes = [event['lifetime_ps']
                            for stats_list in category_collision_stats.values()
                            for event in stats_list]
         equilibrium_fraction = equilibrium_fractions.get(category, np.nan)
 
+        # Mean lifetime and the contribution to the ensemble average
         average_lifetime_ps = np.mean(event_lifetimes) if event_lifetimes else np.nan
         weighted_average = category_summary['average_property'] * equilibrium_fraction
 
-        # Store the category contribution as one row of the output table.
         property_statistics_rows.append({'category': category,
-                                        'average_property': category_summary['average_property'],
-                                        'total_num_events': category_summary['total_num_events'],
-                                        'average_lifetime_ps': average_lifetime_ps,
-                                        'equilibrium_fraction': equilibrium_fraction,
-                                        'weighted_average': weighted_average})
+                                         'average_property': category_summary['average_property'],
+                                         'total_num_events': category_summary['total_num_events'],
+                                         'average_lifetime_ps': average_lifetime_ps,
+                                         'equilibrium_fraction': equilibrium_fraction,
+                                         'weighted_average': weighted_average})
 
-    # Sum the category contributions to obtain the ensemble-average
-    # contribution from all event categories.
+    # Sum of the fractions and of the contributions over the categories
     equilibrium_fraction_values = [row['equilibrium_fraction'] for row in property_statistics_rows]
     all_equilibrium_fraction = np.sum(equilibrium_fraction_values)
     all_weighted_average = np.sum([row['average_property'] * row['equilibrium_fraction']
                                    for row in property_statistics_rows])
 
+    # Mean lifetime over the events of all categories
     event_lifetimes = [event['lifetime_ps']
                        for category_stats in collision_stats.values()
                        for stats_list in category_stats.values()
                        for event in stats_list]
     all_average_lifetime_ps = np.mean(event_lifetimes) if event_lifetimes else np.nan
 
-    # Calculate the all-category average property represented by the included
-    # event categories.
+    # Average property of the events of all categories
     all_average_property = all_weighted_average / all_equilibrium_fraction \
         if all_equilibrium_fraction > 0 else np.nan
 
-    # Append a final row containing the all-category weighted average.
+    # Final row for all categories
     property_statistics_rows.append({'category': 'all',
                                      'average_property': all_average_property,
-                                     'total_num_events': np.sum([row['total_num_events'] for row in property_statistics_rows]),
+                                     'total_num_events': np.sum([row['total_num_events']
+                                                                 for row in property_statistics_rows]),
                                      'average_lifetime_ps': all_average_lifetime_ps,
                                      'equilibrium_fraction': all_equilibrium_fraction,
                                      'weighted_average': all_weighted_average})
 
-    # Convert the table to a DataFrame and format the numeric columns for
-    # display in scientific notation with two decimals.
+    # Convert to a DataFrame and format the floating-point columns in scientific notation
     property_statistics_df = pd.DataFrame(property_statistics_rows)
     for column in ['average_property',
                    'average_lifetime_ps',
@@ -1793,208 +1999,197 @@ def average_property_R_statistics(average_properties,
 
 #     return property_statistics_df
 
-##################################################################################################
+
+###################################################################################################################
 # Trajectory extraction functions using categorized events
-##################################################################################################
+###################################################################################################################
 # TODO: Human check this function
-def collision_event_trajectories(u, 
-                                 categorized_collisions, 
-                                 category, 
-                                 atom_index, 
-                                 event_index):
+def collision_event_trajectories(u: mda.Universe,
+                                 categorized_collisions: dict,
+                                 category: str,
+                                 atom_index: int,
+                                 event_index: int) -> tuple[np.ndarray, np.ndarray]:
     """
-    Retrieve the positions and velocities of each atom involved in a specific collision event.
+    Extract the positions and velocities of all atoms involved in a collision event.
 
-    Inputs:
-    - u: MDAnalysis Universe
-        The MDAnalysis Universe object containing the trajectory and topology.
-    - categorized_collisions: dict
-        A dictionary with four keys: 'two_body_scattering', 'multi_body_scattering', 'perturbed_scattering', 'vdw'.
-        Each key maps to a dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of pandas DataFrames representing the categorized collisions.
-    - category: str
-        The category of the collision event (e.g., 'two_body_scattering').
-    - atom_index: int
-        The index of the atom from group1 involved in the collision event.
-    - event_index: int
-        The index of the specific event for the given atom in the specified category.
+    In each frame, the reference atom is centred in the box and all atoms are wrapped before the positions are
+    read.
 
-    Returns:
-    - positions: numpy array of shape (N_frames, N_atoms, 3)
-        Array of positions for each atom in each frame.
-        Index 0: main atom (atom_index)
-        Index 1: main partner atom
-        Index 2+: other partner atoms
-    - velocities: numpy array of shape (N_frames, N_atoms, 3)
-        Array of velocities for each atom in each frame.
-        Index 0: main atom (atom_index)
-        Index 1: main partner atom
-        Index 2+: other partner atoms
+    Usage: ``positions, velocities = collision_event_trajectories(u, categorized, 'vdw', atom_index, event_index)``
+
+    Parameters
+    ----------
+    u : Universe
+        MDAnalysis Universe containing the trajectory and topology.
+    categorized_collisions : dict
+        Output of categorize_collisions().
+    category : str
+        Category of the event, e.g. 'two_body_scattering'.
+    atom_index : int
+        Atom index of the reference atom.
+    event_index : int
+        Index of the event in the event list of the reference atom in the category.
+
+    Returns
+    -------
+    positions : ndarray
+        Positions in Å with the shape (N_frames, N_atoms, 3). Index 0 of the second axis is the reference atom,
+        index 1 the main partner and indices 2 onwards the other partners in ascending atom-index order.
+    velocities : ndarray
+        Velocities in the MDAnalysis units with the same shape and atom order as positions.
     """
-    # Retrieve the event DataFrame for the specified category, atom index, and event index
+
+    # Event and its main partner
     event_df = categorized_collisions[category][atom_index][event_index]
-
-    # Get the main partner index from the event
     main_partner_idx = main_partner_index(event_df)
 
-    # Collect all unique partner indices throughout the event (excluding main partner)
+    # Other partners of the event in ascending order
     all_partner_indices = set(event_df['atoms2'].explode().unique())
     all_partner_indices.discard(main_partner_idx)
     other_partner_indices = sorted(list(all_partner_indices))
 
-    # Total number of atoms: main atom + main partner + other partners
+    # Number of atoms (reference atom, main partner and other partners) and number of frames
     n_atoms = 2 + len(other_partner_indices)
     n_frames = len(event_df)
 
-    # Initialize arrays to store positions and velocities
+    # Arrays of the positions and velocities
     positions = np.zeros((n_frames, n_atoms, 3))
     velocities = np.zeros((n_frames, n_atoms, 3))
 
-    # Pre-fetch atom groups
+    # AtomGroups of all atoms of the event
     atom_groups = {idx: u.atoms[[idx]] for idx in [atom_index, main_partner_idx] + other_partner_indices}
 
-    # Iterate over each row in the event DataFrame
+    # Go through the frames of the event
     for frame_idx, row in enumerate(event_df.itertuples()):
         frame = row.frame
-        
-        # Set the trajectory to the current frame
+
+        # Move the trajectory to the current frame
         u.trajectory[frame]
-        
-        # Index 0: main atom
+
+        # Reference atom, centred in the box with all atoms wrapped
         atom_group = atom_groups[atom_index]
         center_and_wrap(u, u.trajectory.ts, atom_group)
         positions[frame_idx, 0] = atom_group.positions[0]
         velocities[frame_idx, 0] = atom_group.velocities[0]
-        
-        # Index 1: main partner atom
+
+        # Main partner
         partner_group = atom_groups[main_partner_idx]
         positions[frame_idx, 1] = partner_group.positions[0]
         velocities[frame_idx, 1] = partner_group.velocities[0]
-        
-        # Index 2+: other partner atoms
+
+        # Other partners
         for idx, partner_index in enumerate(other_partner_indices):
             partner_group = atom_groups[partner_index]
             positions[frame_idx, 2 + idx] = partner_group.positions[0]
             velocities[frame_idx, 2 + idx] = partner_group.velocities[0]
-    
+
     return positions, velocities
 
-###########################################################################################################
-# Pipeline functions
-###########################################################################################################
-# Placeholder
 
-#############################################################################################################
+###################################################################################################################
 # Data saving functions
-#############################################################################################################  
-def save_collision_event_trajectories(u,
-                                      categorized_collisions, 
-                                      directory='collision_trajectories'):
+###################################################################################################################
+def save_collision_event_trajectories(u: mda.Universe,
+                                      categorized_collisions: dict,
+                                      directory: str='collision_trajectories') -> None:
     """
-    Retrieve and save the positions and velocities of all collision events in the categorized collisions
-    to .npy files with a structured naming convention.
+    Save the positions and velocities of all classified collision events to .npy files.
 
-    Inputs:
-    - u: MDAnalysis Universe
-        The MDAnalysis Universe object containing the trajectory and topology.
-    - categorized_collisions: dict
-        A dictionary with four keys: 'two_body_scattering', 'multi_body_scattering', 'perturbed_scattering', 'vdw'.
-        Each key maps to a dictionary where:
-        - Keys are atom indices from group1.
-        - Values are lists of pandas DataFrames representing the categorized collisions.
-    - directory: str
-        The directory where the files will be saved. Default is 'collision_trajectories'.
+    The files are named positions_<category>_atom<atom_index>_event<event_index>.npy and
+    velocities_<category>_atom<atom_index>_event<event_index>.npy (see collision_event_trajectories()).
 
-    Returns:
-    - None
+    Usage: ``save_collision_event_trajectories(u, categorized, directory='collision_trajectories')``
+
+    Parameters
+    ----------
+    u : Universe
+        MDAnalysis Universe containing the trajectory and topology.
+    categorized_collisions : dict
+        Output of categorize_collisions().
+    directory : str, default='collision_trajectories'
+        Directory of the saved files, created if it does not exist.
     """
-    total_events = sum(len(categorized_collisions[category][atom_index]) 
+
+    # Total number of events for the progress bar
+    total_events = sum(len(categorized_collisions[category][atom_index])
                        for category in categorized_collisions for atom_index in categorized_collisions[category])
-    
-    # Create the directory if it does not exist
+
+    # Create the output directory
     os.makedirs(directory, exist_ok=True)
 
-    # Iterate over all categorized collisions and save trajectories for each event
+    # Save the trajectories of all events
     with tqdm(total=total_events, desc='Saving collision event trajectories') as pbar:
         for category in categorized_collisions:
             for atom_index in categorized_collisions[category]:
                 for event_index in range(len(categorized_collisions[category][atom_index])):
-                    
-                    # Get trajectories for the specified collision event
-                    positions, velocities = collision_event_trajectories(u, categorized_collisions, 
+
+                    # Positions and velocities of the event
+                    positions, velocities = collision_event_trajectories(u, categorized_collisions,
                                                                          category, atom_index, event_index)
 
-                    # Construct file names based on the category, atom index, and event index
+                    # File names from the category, atom index and event index
                     positions_filename = f'{directory}/positions_{category}_atom{atom_index}_event{event_index}.npy'
                     velocities_filename = f'{directory}/velocities_{category}_atom{atom_index}_event{event_index}.npy'
 
-                    # Save positions and velocities to .npy files
+                    # Save the arrays
                     np.save(positions_filename, positions)
                     np.save(velocities_filename, velocities)
 
                     pbar.update(1)
 
-###############################################################################################################
+
+###################################################################################################################
 # Miscellaneous helper functions
-###############################################################################################################
-def sort_collision_statistics(collision_stats, 
-                              property_name,
-                              atomwise=True,
-                              reverse=True):
+###################################################################################################################
+def sort_collision_statistics(collision_stats: dict,
+                              property_name: str,
+                              atomwise: bool=True,
+                              reverse: bool=True) -> dict:
     """
-    Sort collision statistics by a given property.
+    Sort the event statistics by a given field.
 
-    Inputs:
-    - collision_stats: dict
-        A dictionary with the same keys as categorized_events, where each
-        category value is a dictionary with atom indices as keys and lists
-        of dictionaries containing statistics for each event as values.
-    - property_name: str
-        The name of the property to sort by (e.g., 'lifetime_ps').
-    - atomwise: bool
-        If True (default), sort the event statistics separately for each
-        atom within each category and preserve the nested dictionary
-        structure. If False, combine the events of all atoms within each
-        category into one list, sort that list, and store the source atom
-        index for each event under the key 'atom_index'.
-    - reverse: bool
-        If True (default), sort in descending order. If False, sort in
-        ascending order.
+    Usage: ``sorted_stats = sort_collision_statistics(collision_stats, 'lifetime_ps', atomwise=False)``
 
-    Returns:
-    - sorted_stats: dict
-        If atomwise is True, a dictionary with the same nested structure as
-        collision_stats, where the list of event statistics for each atom is
-        sorted by the specified property in descending order.
-        If atomwise is False, a dictionary keyed by category, where each
-        value is a sorted list of event-statistics dictionaries collected
-        from all atoms in that category. Each event dictionary then also
-        contains the corresponding atom index under the key 'atom_index'.
+    Parameters
+    ----------
+    collision_stats : dict
+        Output of collision_statistics() or combine_collision_statistics().
+    property_name : str
+        Field of the event statistics to sort by, e.g. 'lifetime_ps'.
+    atomwise : bool, default=True
+        If True, sort the events of each reference atom separately and keep the nested structure. If False,
+        pool the events of all reference atoms of each category into one sorted list.
+    reverse : bool, default=True
+        If True, sort in descending order. If False, sort in ascending order.
+
+    Returns
+    -------
+    sorted_stats : dict
+        If atomwise is True, the same nested structure as collision_stats with sorted event lists. If atomwise
+        is False, category mapped to a sorted list of event statistics, each with the additional key
+        'atom_index' for its reference atom.
     """
+
+    # Sorted statistics of each category
     sorted_stats = {}
-    
-    # Sort each category either atomwise or across all atoms.
     for category, atoms_dict in collision_stats.items():
+
+        # Sort the events of each reference atom separately
         if atomwise:
             sorted_stats[category] = {}
-
-            # Sort the event list for each atom by the requested property.
             for atom_index, stats_list in atoms_dict.items():
                 sorted_stats[category][atom_index] = sorted(stats_list,
                                                             key=lambda x: x[property_name],
                                                             reverse=reverse)
+
+        # Pool the events of all reference atoms, recording the reference atom of each, and sort them
         else:
             combined_stats = []
-
-            # Collect all event statistics for the category into one list.
             for atom_index, stats_list in atoms_dict.items():
                 for event_stats in stats_list:
                     event_stats_with_atom = dict(event_stats)
                     event_stats_with_atom['atom_index'] = atom_index
                     combined_stats.append(event_stats_with_atom)
-
-            # Sort the combined event list across all atoms.
             sorted_stats[category] = sorted(combined_stats,
                                             key=lambda x: x[property_name],
                                             reverse=reverse)
