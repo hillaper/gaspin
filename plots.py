@@ -982,3 +982,86 @@ def plot_all_event_counts_by_lifetime(counts_by_lifetime: dict,
     if savename:
         fig.savefig(f"{savename}.png", dpi=200)
     plt.show()
+
+
+def plot_bound_cluster_event(series: dict,
+                             dt: float,
+                             collision_cutoff: float,
+                             event: dict | None=None,
+                             r_min: float | None=None,
+                             show_internal_energy: bool=True,
+                             title: str | None=None,
+                             savename: str | None=None) -> None:
+    """
+    Plot the pair distances and binding energies of the atoms of a bound-cluster event.
+
+    The upper panel shows the distance R(t) of every pair of atoms, with the collision cutoff as a red dashed
+    line and, optionally, the minimum of the pair potential as a grey dotted line. The lower panel shows the
+    energy of each atom relative to the rest of the atoms and, optionally, the internal energy of the whole set,
+    with zero as a dotted line, so that an atom is bound to the others where its curve is negative. The internal
+    energy is meaningful only if the same atoms form the cluster throughout. If the event is given, the time is
+    measured from its first frame, and the frames between its first and last frame are shaded.
+
+    Usage: ``plot_bound_cluster_event(series, 25e-15, 9.0, event=event, r_min=4.378, savename='trimer_1')``
+
+    Parameters
+    ----------
+    series : dict
+        Output of gpsp_tools.md_analysis.bound_cluster_time_series().
+    dt : float
+        Time step between frames in seconds.
+    collision_cutoff : float
+        Cutoff distance of the collision detection in Å.
+    event : dict, default=None
+        Cluster event of gpsp_tools.md_analysis.bound_cluster_events(), whose frames are shaded.
+    r_min : float, default=None
+        Distance of the minimum of the pair potential in Å.
+    show_internal_energy : bool, default=True
+        If True, plot the internal energy of the whole set of atoms.
+    title : str, default=None
+        Title of the figure.
+    savename : str, default=None
+        Path of the saved figure without the extension. If None, the figure is not saved.
+    """
+
+    # Time axis in ps, measured from the first frame of the event if it is given
+    start_frame = event['start_frame'] if event is not None else 0
+    time_ps = (series['frames'] - start_frame) * dt * 1e12
+
+    # Two panels sharing the time axis
+    fig, (ax_distance, ax_energy) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    # Pair distances, with the cutoff and the minimum of the pair potential
+    for k, (i, j) in enumerate(series['pairs']):
+        ax_distance.plot(time_ps, series['distances'][:, k], linewidth=1.5, label=f'{i}–{j}')
+    ax_distance.axhline(collision_cutoff, color='r', linestyle='--', alpha=0.5)
+    if r_min is not None:
+        ax_distance.axhline(r_min, color='grey', linestyle=':', alpha=0.8)
+    ax_distance.set_ylabel('$R$ (Å)')
+    ax_distance.set_ylim(2, collision_cutoff + 1)
+
+    # Energy of each atom relative to the rest and the internal energy of the whole set of atoms
+    for k, atom in enumerate(series['atoms']):
+        ax_energy.plot(time_ps, series['atom_energies'][:, k], linewidth=1.2, alpha=0.8, label=f'Atom {atom}')
+    if show_internal_energy:
+        ax_energy.plot(time_ps, series['internal_energy'], color='black', linewidth=2, label='Internal energy')
+    ax_energy.axhline(0.0, color='black', linestyle=':', alpha=0.8)
+    ax_energy.set_xlabel('Time from the start of the event (ps)' if event is not None else 'Time (ps)')
+    ax_energy.set_ylabel('$E$ (K)')
+
+    # Shade the frames in which the bound cluster exists
+    if event is not None:
+        for ax in (ax_distance, ax_energy):
+            ax.axvspan(0.0, (event['end_frame'] - start_frame) * dt * 1e12, color='tab:red', alpha=0.08)
+
+    # Legends for at most ten pairs and atoms, title, layout, saving if requested and showing the figure
+    if len(series['pairs']) <= 10:
+        ax_distance.legend(fontsize=11, ncol=2, loc='upper right')
+    if len(series['atoms']) <= 10:
+        ax_energy.legend(fontsize=11, ncol=2, loc='lower right')
+    if title:
+        ax_distance.set_title(title, fontsize=14)
+    plt.tight_layout()
+    if savename:
+        fig.savefig(f"{savename}.png", dpi=200)
+    plt.show()
