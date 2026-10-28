@@ -2231,6 +2231,7 @@ def bound_cluster_events(frame_clusters: dict,
         - 'start_frame' and 'end_frame': first and last frame with the cluster,
         - 'lifetime_ps': time from the first to the last frame with the cluster, inclusive, in ps,
         - 'atoms': tuple of all atom indices that belonged to the cluster during the event,
+        - 'first_atoms' and 'last_atoms': tuples of the atom indices of the cluster in the first and last frame,
         - 'max_size': largest number of atoms in the cluster in one frame,
         - 'frames': array of the frames with the cluster, and
         - 'sizes': array of the number of atoms in the cluster in those frames.
@@ -2258,7 +2259,7 @@ def bound_cluster_events(frame_clusters: dict,
             # Start a new event if the cluster overlaps none
             if not overlapping:
                 active.append({'frames': [frame], 'sizes': [len(cluster)], 'atoms': set(cluster_atoms),
-                               'last_atoms': set(cluster_atoms)})
+                               'first_atoms': set(cluster_atoms), 'last_atoms': set(cluster_atoms)})
                 continue
 
             # Merge all overlapping events into the earliest one
@@ -2270,6 +2271,8 @@ def bound_cluster_events(frame_clusters: dict,
                 event['frames'] = [f for f, _ in merged]
                 event['sizes'] = [s for _, s in merged]
                 event['atoms'] |= other['atoms']
+                if other['frames'][0] == event['frames'][0]:
+                    event['first_atoms'] |= other['first_atoms']
                 active.remove(other)
 
             # Add the cluster of this frame, keeping the larger cluster if the frame is already present
@@ -2293,11 +2296,99 @@ def bound_cluster_events(frame_clusters: dict,
                        'end_frame': int(frames[-1]),
                        'lifetime_ps': (frames[-1] - frames[0] + 1) * dt * 1e12,
                        'atoms': tuple(sorted(event['atoms'])),
+                       'first_atoms': tuple(sorted(event['first_atoms'])),
+                       'last_atoms': tuple(sorted(event['last_atoms'])),
                        'max_size': int(max(event['sizes'])),
                        'frames': frames,
                        'sizes': np.array(event['sizes'])})
 
     return events
+
+
+def bridge_bound_cluster_events(u: mda.Universe,
+                                events: list[dict],
+                                cutoff: float,
+                                dt: float,
+                                min_shared: int=3) -> list[dict]:
+    """
+    Merge consecutive cluster events of the same atoms whose atoms stay together during the gap between them.
+
+    The energy criterion of hill_bound_clusters() can split a cluster that is bound as a whole, when the energy of
+    one atom relative to the others is positive for a while without the atom leaving. Two events are therefore
+    merged if at least min_shared atoms of the last cluster of the earlier event are also in the first cluster of
+    the later one, and if these shared atoms stay connected within the cutoff in every frame of the gap, i.e. the
+    graph of their pairs closer than the cutoff is connected. Only an actual separation then ends an event. The
+    merged event spans the gap, and its 'frames' and 'sizes' remain those of the frames with a bound cluster.
+    Distances follow the minimum-image convention.
+
+    Usage: ``events = bridge_bound_cluster_events(u, events, 9.0, 25e-15)``
+
+    Parameters
+    ----------
+    u : Universe
+        MDAnalysis Universe containing the trajectory from which the events were found.
+    events : list of dict
+        Output of bound_cluster_events().
+    cutoff : float
+        Largest distance of a connected pair during a gap, in Å.
+    dt : float
+        Time step between frames in seconds.
+    min_shared : int, default=3
+        Smallest number of atoms shared by the clusters on both sides of a gap.
+
+    Returns
+    -------
+    bridged_events : list of dict
+        Cluster events sorted by their first frame, with the keys of bound_cluster_events() and 'n_bridges', the
+        number of gaps bridged within the event.
+    """
+
+    # Events sorted by their first frame, copied so that the input is not changed
+    pending = [dict(event, n_bridges=0) for event in sorted(events, key=lambda item: item['start_frame'])]
+    bridged_events = []
+    while pending:
+        event = pending.pop(0)
+
+        # Repeatedly merge the earliest later event that shares enough atoms and is reached without separation
+        merged = True
+        while merged:
+            merged = False
+            for later in pending:
+                shared = sorted(set(event['last_atoms']) & set(later['first_atoms']))
+                if later['start_frame'] <= event['end_frame'] or len(shared) < min_shared:
+                    continue
+
+                # Check that the shared atoms stay connected within the cutoff in every frame of the gap
+                atoms = u.atoms[shared]
+                connected = True
+                for ts in u.trajectory[event['end_frame'] + 1:later['start_frame']]:
+                    pair_distances = mda_distances.self_distance_array(atoms.positions, box=ts.dimensions)
+                    i, j = np.triu_indices(len(shared), k=1)
+                    close = pair_distances < cutoff
+                    graph = coo_matrix((np.ones(np.count_nonzero(close)), (i[close], j[close])),
+                                       shape=(len(shared), len(shared)))
+                    if connected_components(graph, directed=False)[0] > 1:
+                        connected = False
+                        break
+                if not connected:
+                    continue
+
+                # Merge the later event into this one
+                event = dict(event,
+                             end_frame=later['end_frame'],
+                             lifetime_ps=(later['end_frame'] - event['start_frame'] + 1) * dt * 1e12,
+                             atoms=tuple(sorted(set(event['atoms']) | set(later['atoms']))),
+                             last_atoms=later['last_atoms'],
+                             max_size=max(event['max_size'], later['max_size']),
+                             frames=np.concatenate([event['frames'], later['frames']]),
+                             sizes=np.concatenate([event['sizes'], later['sizes']]),
+                             n_bridges=event['n_bridges'] + later['n_bridges'] + 1)
+                pending.remove(later)
+                merged = True
+                break
+        bridged_events.append(event)
+
+    return bridged_events
 
 
 def bound_cluster_time_series(u: mda.Universe,
