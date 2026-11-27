@@ -1,8 +1,11 @@
 __pycache__/
 .ipynb_checkpoints/
 .virtual_documents/
+.pytest_cache/
 build/
 dist/
+*.egg-info/
 *DOODLE*
 *pickle*
-/src/*.egg-info/
+*_offsets.npz
+*_offsets.lock

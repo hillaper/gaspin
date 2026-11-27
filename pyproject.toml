@@ -1,0 +1,42 @@
+[project]
+name = "gaspin"
+version = "0.1.0"
+authors = [
+    {name = "Perttu Hilla"},
+]
+description = "Collision events, bound clusters and ensemble-averaged pair properties from molecular dynamics of atomic gases."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+dependencies = [
+    "numpy >= 2.0",
+    "scipy >= 1.11",
+    "pandas >= 2.0",
+    "MDAnalysis >= 2.7",
+    "joblib >= 1.3",
+    "tqdm >= 4.66",
+    "matplotlib >= 3.8",
+]
+
+[project.optional-dependencies]
+test = ["pytest >= 8.0"]
+
+[project.urls]
+Repository = "https://github.com/hillaper/gaspin"
+
+[build-system]
+requires = ["setuptools >= 77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

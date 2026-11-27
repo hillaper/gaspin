@@ -1,5 +1,5 @@
 """
-Magnetic resonance properties of gas-phase systems.
+Ensemble averages of distance-dependent pair properties of an atomic gas.
 
 This module provides the ensemble averages of distance-dependent pair properties, such as the nuclear shielding
 or the spin-spin coupling of an atom pair at distance R. The averages are obtained either from a radial
@@ -132,10 +132,10 @@ def coordination_number_from_rdf(r: np.ndarray,
                                      N_other_atoms=N_other_atoms)
 
 
-def first_order_virial_coefficient(r: np.ndarray,
-                                   p_r: np.ndarray,
-                                   V_r: np.ndarray,
-                                   T: float) -> float:
+def second_virial_coefficient(r: np.ndarray,
+                              p_r: np.ndarray,
+                              V_r: np.ndarray,
+                              T: float) -> float:
     """
     Calculate the second virial coefficient of a distance-dependent pair property.
 
@@ -148,7 +148,7 @@ def first_order_virial_coefficient(r: np.ndarray,
     and the average of the property summed over all neighbours of an atom at number density n is n B(T). The
     integral is evaluated with the trapezoidal rule.
 
-    Usage: ``B_T = first_order_virial_coefficient(r, p_r, V_r, T)``
+    Usage: ``B_T = second_virial_coefficient(r, p_r, V_r, T)``
 
     Parameters
     ----------

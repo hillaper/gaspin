@@ -2,16 +2,18 @@
 Plotting functions for the collision events of gas-phase MD trajectories.
 
 The functions plot the distance and property series of single events and the statistics of the classified
-events (see gpsp_tools.md_analysis). The categories are drawn in a fixed order and colour: two-body scattering
-(TBS) in blue, multi-body scattering (MBS) in orange, perturbed scattering (PS) in green and van der Waals (vdW)
-events in red. A common plotting style is applied on import.
+events. The categories are drawn in a fixed order and colour: two-body scattering (TBS) in blue, multi-body
+scattering (MBS) in orange, perturbed scattering (PS) in green and van der Waals (vdW) events in red. The common
+plotting style is applied with set_plot_style(). Each function returns its figure, which can then be shown,
+modified or saved.
 """
 
 # Imports
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.figure import Figure
 
-import gpsp_tools.md_analysis as gpmda
+from gaspin._core._collisions import main_partner_index
 
 # Order, colours and titles of the event categories
 CATEGORY_ORDER = ['two_body_scattering', 'multi_body_scattering', 'perturbed_scattering', 'vdw']
@@ -27,9 +29,6 @@ CATEGORY_TITLES = {
 }
 
 CATEGORY_SHORT_TITLES = {
-    # 'two_body_scattering': 'TB-S',
-    # 'multi_body_scattering': 'MB-S',
-    # 'perturbed_scattering': 'P-S',
     'two_body_scattering': 'TBS',
     'multi_body_scattering': 'MBS',
     'perturbed_scattering': 'PS',
@@ -48,16 +47,12 @@ CATEGORY_MIN_NUM_ATOMS = {
 def _category_event_stats(event_stats: dict,
                           category: str) -> list:
     """
-    Return the event statistics of one category as a flat list.
-
-    Both the nested structure (category, atom index, list of events) of
-    gpsp_tools.md_analysis.collision_statistics() and the older flat structure (category, list of events) are
-    supported. In the nested structure, the events are ordered by the atom index.
+    Return the event statistics of one category as a flat list, ordered by the atom index.
 
     Parameters
     ----------
     event_stats : dict
-        Event statistics.
+        Event statistics, as given by collision_statistics().
     category : str
         Category to extract.
 
@@ -71,27 +66,24 @@ def _category_event_stats(event_stats: dict,
     if category not in event_stats:
         return []
 
-    category_stats = event_stats[category]
+    # Events of all reference atoms in the order of the atom index
+    flattened_stats = []
+    for atom_index in sorted(event_stats[category]):
+        flattened_stats.extend(event_stats[category][atom_index])
 
-    # Nested structure: category, atom index, list of events
-    if isinstance(category_stats, dict):
-        flattened_stats = []
-        for atom_index in sorted(category_stats):
-            flattened_stats.extend(category_stats[atom_index])
-        return flattened_stats
-
-    # Older flat structure
-    return list(category_stats)
+    return flattened_stats
 
 
 ###################################################################################################################
 # Plotting style
 ###################################################################################################################
-def set_gpsp_plot_style() -> None:
+def set_plot_style() -> None:
     """
-    Set the common Matplotlib style of the gpsp_tools figures.
+    Set the common Matplotlib style of the gaspin figures.
 
-    The style is applied when the module is imported.
+    The style changes the global Matplotlib settings (rcParams) of the session.
+
+    Usage: ``set_plot_style()``
     """
 
     # Figure size, font sizes, line width, legend and grid, with a LaTeX-like serif font
@@ -117,9 +109,6 @@ def set_gpsp_plot_style() -> None:
     })
 
 
-# Apply the style on import
-set_gpsp_plot_style()
-
 
 ###################################################################################################################
 # Plotting functions
@@ -132,7 +121,8 @@ def plot_distance_series_for_event(categorized_events: dict,
                                    x_axis: str='frames',
                                    dt: float | None=None,
                                    xlims: tuple[float, float] | None=None,
-                                   savename: str | None=None) -> None:
+                                   distance_limits: tuple[float, float] | None=None,
+                                   savename: str | None=None) -> Figure | None:
     """
     Plot the distances between the reference atom and all partners of one event.
 
@@ -145,7 +135,7 @@ def plot_distance_series_for_event(categorized_events: dict,
     Parameters
     ----------
     categorized_events : dict
-        Output of gpsp_tools.md_analysis.categorize_collisions().
+        Output of categorize_collisions().
     category : str
         Category of the event: 'two_body_scattering', 'multi_body_scattering', 'perturbed_scattering' or 'vdw'.
     atom_index : int
@@ -160,8 +150,15 @@ def plot_distance_series_for_event(categorized_events: dict,
         Time step between frames in seconds. Required if x_axis is 'time'.
     xlims : tuple of float, default=None
         Limits of the x-axis in the units of the selected x-axis quantity.
+    distance_limits : tuple of float, default=None
+        Limits of the distance axis in Å. If None, they are set automatically.
     savename : str, default=None
         Path of the saved figure without the extension. If None, the figure is not saved.
+
+    Returns
+    -------
+    fig : Figure or None
+        Figure of the plot, or None if there are no data to plot.
 
     Raises
     ------
@@ -195,7 +192,7 @@ def plot_distance_series_for_event(categorized_events: dict,
                 x_label = 'Frame'
 
             # Main partner of the event
-            main_partner_index = gpmda.main_partner_index(event_df)
+            main_partner = main_partner_index(event_df)
 
             # Collect the x-values and distances of each partner
             distances_by_partner = {}
@@ -209,35 +206,26 @@ def plot_distance_series_for_event(categorized_events: dict,
             # Plot the main partner in black and the third bodies semi-transparent
             fig = plt.figure()
             for partner_atom, data in distances_by_partner.items():
-                if partner_atom == main_partner_index:
-                    # plt.plot(data['frames'], data['distances'], color='black', label=f'Main collider {partner_atom}')
-                    plt.plot(data['frames'], data['distances'], color='black', label=f'Main collider')
+                if partner_atom == main_partner:
+                    plt.plot(data['frames'], data['distances'], color='black', label='Main collider')
                 else:
-                    # plt.plot(data['frames'], data['distances'], label=f'Third-body {partner_atom}', alpha=0.5)
-                    plt.plot(data['frames'], data['distances'], label=f'Third-body', alpha=0.5)
+                    plt.plot(data['frames'], data['distances'], label='Third body', alpha=0.5)
 
             # Axis labels and limits, and the cutoff distance
-            # plt.title(f'Atom {atom_index} - Event {event_index} - {CATEGORY_TITLES.get(category, category)}')
-            # plt.title(f'{CATEGORY_TITLES.get(category, category)}')
             plt.xlabel(x_label)
-            # plt.ylabel('Distance (Å)'
             plt.ylabel('$R$ (Å)')
-            plt.ylim(2, collision_cutoff + 1)
+            if distance_limits is not None:
+                plt.ylim(distance_limits)
             if xlims:
                 plt.xlim(xlims)
             plt.axhline(y=collision_cutoff, color='r', linestyle='--', alpha=0.5)
 
-            # Number of third bodies, used for the optional legend below
-            num_other_atoms = len(distances_by_partner) - 1 if main_partner_index is not None \
-                else len(distances_by_partner)
-            # if num_other_atoms <= 8:
-            #     plt.legend()
-
-            # Finalise the layout, save the figure if requested and show it
+            # Finalise the layout and save the figure if requested
             plt.tight_layout()
             if savename:
                 fig.savefig(f"{savename}.png", dpi=200)
-            plt.show()
+
+            return fig
 
         # Report an event index out of range
         else:
@@ -256,7 +244,7 @@ def plot_property_series_for_event(categorized_events: dict,
                                    event_index: int | None=None,
                                    xlims: tuple[float, float] | None=None,
                                    ylims: tuple[float, float] | None=None,
-                                   savename: str | None=None) -> None:
+                                   savename: str | None=None) -> Figure | None:
     """
     Plot the property series of all partners of one event against the frame number.
 
@@ -269,9 +257,9 @@ def plot_property_series_for_event(categorized_events: dict,
     Parameters
     ----------
     categorized_events : dict
-        Output of gpsp_tools.md_analysis.categorize_collisions().
+        Output of categorize_collisions().
     property_series : dict
-        First output of gpsp_tools.md_analysis.property_R_all_partners_time_series(): atom index of each partner
+        First output of property_R_all_partners_time_series(): atom index of each partner
         mapped to the property in each frame of the event.
     property_name : str, default='Property'
         Label of the y-axis.
@@ -287,6 +275,11 @@ def plot_property_series_for_event(categorized_events: dict,
         Limits of the y-axis.
     savename : str, default=None
         Path of the saved figure without the extension. If None, the figure is not saved.
+
+    Returns
+    -------
+    fig : Figure or None
+        Figure of the plot, or None if there are no data to plot.
     """
 
     # Check that the reference atom has events in the category
@@ -299,17 +292,17 @@ def plot_property_series_for_event(categorized_events: dict,
 
             # Frames of the event and its main partner
             frames = event_df['frame']
-            main_partner_index = gpmda.main_partner_index(event_df)
+            main_partner = main_partner_index(event_df)
 
             # Stop if there are no property data
             if not property_series:
                 print('No property series data to plot.')
-                return
+                return None
 
             # Plot the main partner in black and the other partners semi-transparent
             fig = plt.figure()
             for partner_atom, values in property_series.items():
-                if partner_atom == main_partner_index:
+                if partner_atom == main_partner:
                     plt.plot(frames, values, color='black', label=f'Main Atom {partner_atom}')
                 else:
                     plt.plot(frames, values, label=f'Atom {partner_atom}', alpha=0.5)
@@ -324,15 +317,16 @@ def plot_property_series_for_event(categorized_events: dict,
                 plt.ylim(ylims)
 
             # Show the legend only for at most eight other partners
-            num_other_atoms = len(property_series) - 1 if main_partner_index is not None else len(property_series)
+            num_other_atoms = len(property_series) - 1 if main_partner is not None else len(property_series)
             if num_other_atoms <= 8:
                 plt.legend()
 
-            # Finalise the layout, save the figure if requested and show it
+            # Finalise the layout and save the figure if requested
             plt.tight_layout()
             if savename:
                 fig.savefig(f"{savename}.png", dpi=200)
-            plt.show()
+
+            return fig
 
         # Report an event index out of range
         else:
@@ -344,20 +338,25 @@ def plot_property_series_for_event(categorized_events: dict,
 
 
 def plot_collision_counts(collision_counts: dict,
-                          savename: str | None=None) -> None:
+                          savename: str | None=None) -> Figure:
     """
     Plot the number of events in each category as a bar chart on a logarithmic scale.
 
     Each bar is annotated with the count and its percentage of all events.
 
-    Usage: ``plot_collision_counts(gpsp_tools.md_analysis.collision_counts(collision_stats))``
+    Usage: ``plot_collision_counts(collision_counts(collision_stats))``
 
     Parameters
     ----------
     collision_counts : dict
-        Category mapped to the number of events, as given by gpsp_tools.md_analysis.collision_counts().
+        Category mapped to the number of events, as given by collision_counts().
     savename : str, default=None
         Path of the saved figure without the extension. If None, the figure is not saved.
+
+    Returns
+    -------
+    fig : Figure
+        Figure of the plot.
     """
 
     # Labels and counts in the fixed category order
@@ -387,22 +386,20 @@ def plot_collision_counts(collision_counts: dict,
 
     # Headroom above the tallest bar for the annotations
     ymax = max(counts) if counts else 1
-    # plt.ylim(0.8, ymax * 2.2)
     plt.ylim(0.8, ymax * 3)
 
-    # plt.title('Total collision counts by category')
-
-    # Finalise the layout, save the figure if requested and show it
+    # Finalise the layout and save the figure if requested
     plt.tight_layout()
     if savename:
         fig.savefig(f"{savename}.png", dpi=200)
-    plt.show()
+
+    return fig
 
 
 def plot_event_lifetimes(event_stats: dict,
                          category: str,
                          bins: int=20,
-                         savename: str | None=None) -> None:
+                         savename: str | None=None) -> Figure | None:
     """
     Plot the histogram of the event lifetimes of one category.
 
@@ -414,20 +411,24 @@ def plot_event_lifetimes(event_stats: dict,
     Parameters
     ----------
     event_stats : dict
-        Event statistics, as given by gpsp_tools.md_analysis.collision_statistics(), or the older flat
-        structure (category mapped to a list of event statistics).
+        Event statistics, as given by collision_statistics().
     category : str
         Category to plot: 'two_body_scattering', 'multi_body_scattering', 'perturbed_scattering' or 'vdw'.
     bins : int, default=20
         Number of histogram bins.
     savename : str, default=None
         Path of the saved figure without the extension. If None, the figure is not saved.
+
+    Returns
+    -------
+    fig : Figure or None
+        Figure of the plot, or None if there are no data to plot.
     """
 
     # Stop for a missing category
     if category not in event_stats:
         print(f"Category '{category}' not found in event_stats.")
-        return
+        return None
 
     title = CATEGORY_TITLES.get(category, category)
 
@@ -438,7 +439,7 @@ def plot_event_lifetimes(event_stats: dict,
     # Stop if the category has no events
     if not lifetimes:
         print(f"No data for {category}.")
-        return
+        return None
 
     # Histogram in the category colour
     fig = plt.figure(figsize=(8, 5))
@@ -454,17 +455,18 @@ def plot_event_lifetimes(event_stats: dict,
     if category != 'vdw':
         plt.yscale('log')
 
-    # Finalise the layout, save the figure if requested and show it
+    # Finalise the layout and save the figure if requested
     plt.grid(axis='y', alpha=0.7)
     plt.tight_layout()
     if savename:
         fig.savefig(f"{savename}.png", dpi=200)
-    plt.show()
+
+    return fig
 
 
 def plot_all_event_lifetimes(event_stats: dict,
                              bins: int=20,
-                             savename: str | None=None) -> None:
+                             savename: str | None=None) -> Figure:
     """
     Plot the histograms of the event lifetimes of all four categories in a 2x2 grid.
 
@@ -477,12 +479,16 @@ def plot_all_event_lifetimes(event_stats: dict,
     Parameters
     ----------
     event_stats : dict
-        Event statistics, as given by gpsp_tools.md_analysis.collision_statistics(), or the older flat
-        structure (category mapped to a list of event statistics).
+        Event statistics, as given by collision_statistics().
     bins : int, default=20
         Number of histogram bins in each panel.
     savename : str, default=None
         Path of the saved figure without the extension. If None, the figure is not saved.
+
+    Returns
+    -------
+    fig : Figure
+        Figure of the plot.
     """
 
     def log_lifetime_fit(hist_counts: np.ndarray,
@@ -571,12 +577,7 @@ def plot_all_event_lifetimes(event_stats: dict,
                     if lifetime_parameter is None:
                         fit_label = rf'$\ln(N) = A$, $A = {intercept:+.2f}$'
                     else:
-                        fit_label = (
-                            # rf'$\ln(N) = -\frac{{\tau}}{{{lifetime_parameter:.2f}}}'
-                            # rf' {intercept:+.2f}$'
-                            # rf'$\ln(N) = {intercept:.2f} - \frac{{\tau}}{{{lifetime_parameter:.2f}}}$'
-                            rf'$\ln[N(\tau)] = {intercept:.2f} - \frac{{\tau}}{{{lifetime_parameter:.2f}}}$'
-                        )
+                        fit_label = rf'$\ln[N(\tau)] = {intercept:.2f} - \frac{{\tau}}{{{lifetime_parameter:.2f}}}$'
 
                     axes[idx].text(
                         0.95,
@@ -585,7 +586,6 @@ def plot_all_event_lifetimes(event_stats: dict,
                         transform=axes[idx].transAxes,
                         ha='right',
                         va='top',
-                        # fontsize=20,
                         fontsize=24,
                         bbox=dict(facecolor='white', alpha=0.8, edgecolor='none')
                     )
@@ -597,15 +597,11 @@ def plot_all_event_lifetimes(event_stats: dict,
                     axes[idx].set_ylabel('Count')
 
                 # Logarithmic y-axis for all categories
-                # if category != 'vdw':
                 axes[idx].set_yscale('log')
 
                 # Headroom above the tallest bar for the annotations
                 ymax = max(hist_counts) if len(hist_counts) > 0 else 1
-                # if not category == 'vdw':
                 axes[idx].set_ylim(0.8, ymax**1.1)
-                # else:
-                    # axes[idx].set_ylim(None, ymax * 1.1)
                 axes[idx].grid(axis='y', alpha=0.7)
                 axes[idx].set_title(title)
 
@@ -619,16 +615,17 @@ def plot_all_event_lifetimes(event_stats: dict,
             axes[idx].text(0.5, 0.5, f"No data for {title}", ha='center', va='center')
             axes[idx].set_title(title)
 
-    # Finalise the layout, save the figure if requested and show it
+    # Finalise the layout and save the figure if requested
     plt.tight_layout()
     if savename:
         fig.savefig(f"{savename}.png", dpi=200)
-    plt.show()
+
+    return fig
 
 
 def plot_event_num_atoms(event_stats: dict,
                          category: str,
-                         savename: str | None=None) -> None:
+                         savename: str | None=None) -> Figure | None:
     """
     Plot the histogram of the number of atoms involved in the events of one category.
 
@@ -640,18 +637,22 @@ def plot_event_num_atoms(event_stats: dict,
     Parameters
     ----------
     event_stats : dict
-        Event statistics, as given by gpsp_tools.md_analysis.collision_statistics(), or the older flat
-        structure (category mapped to a list of event statistics).
+        Event statistics, as given by collision_statistics().
     category : str
         Category to plot, typically 'multi_body_scattering', 'perturbed_scattering' or 'vdw'.
     savename : str, default=None
         Path of the saved figure without the extension. If None, the figure is not saved.
+
+    Returns
+    -------
+    fig : Figure or None
+        Figure of the plot, or None if there are no data to plot.
     """
 
     # Stop for a missing category
     if category not in event_stats:
         print(f"Category '{category}' not found in event_stats.")
-        return
+        return None
 
     title = CATEGORY_TITLES.get(category, category)
 
@@ -660,7 +661,7 @@ def plot_event_num_atoms(event_stats: dict,
     num_atoms = [event['num_atoms_involved'] for event in category_events]
     if not num_atoms:
         print(f"No data for {category}.")
-        return
+        return None
 
     # Smallest possible number of atoms of the category
     min_num_atoms = CATEGORY_MIN_NUM_ATOMS.get(category, 2)
@@ -678,16 +679,17 @@ def plot_event_num_atoms(event_stats: dict,
     plt.ylabel('Count')
     plt.xticks(range(min_num_atoms, max(num_atoms)+1))
 
-    # Finalise the layout, save the figure if requested and show it
+    # Finalise the layout and save the figure if requested
     plt.grid(axis='y', alpha=0.7)
     plt.tight_layout()
     if savename:
         fig.savefig(f"{savename}.png", dpi=200)
-    plt.show()
+
+    return fig
 
 
 def plot_all_event_num_atoms(event_stats: dict,
-                             savename: str | None=None) -> None:
+                             savename: str | None=None) -> Figure:
     """
     Plot the histograms of the number of atoms involved in the MBS, PS and vdW events in a 1x3 grid.
 
@@ -698,10 +700,14 @@ def plot_all_event_num_atoms(event_stats: dict,
     Parameters
     ----------
     event_stats : dict
-        Event statistics, as given by gpsp_tools.md_analysis.collision_statistics(), or the older flat
-        structure (category mapped to a list of event statistics).
+        Event statistics, as given by collision_statistics().
     savename : str, default=None
         Path of the saved figure without the extension. If None, the figure is not saved.
+
+    Returns
+    -------
+    fig : Figure
+        Figure of the plot.
     """
 
     # Categories in which three or more atoms can be involved, in a 1x3 grid
@@ -735,7 +741,6 @@ def plot_all_event_num_atoms(event_stats: dict,
                     if count > 0:
                         percent = count / total * 100
                         if category == 'vdw':
-                            # label = f'{int(count)}'
                             label = f'{percent:.0f}%'
                             font_size = 10
                         else:
@@ -750,7 +755,6 @@ def plot_all_event_num_atoms(event_stats: dict,
 
                 # Headroom above the tallest bar for the annotations
                 ymax = max(hist_counts) if len(hist_counts) > 0 else 1
-                # axes[idx].set_ylim(0.8, ymax * 2.2)
                 axes[idx].set_ylim(0.8, ymax**1.1)
 
                 # Integer ticks, every second one if there are more than ten
@@ -770,17 +774,18 @@ def plot_all_event_num_atoms(event_stats: dict,
             axes[idx].text(0.5, 0.5, f"No data for {title}", ha='center', va='center')
             axes[idx].set_title(title)
 
-    # Finalise the layout, save the figure if requested and show it
+    # Finalise the layout and save the figure if requested
     plt.tight_layout()
     if savename:
         fig.savefig(f"{savename}.png", dpi=200)
-    plt.show()
+
+    return fig
 
 
 def plot_event_counts_by_lifetime(counts: list,
                                   lifetime_ranges: list[tuple[float, float]],
                                   category: str,
-                                  savename: str | None=None) -> None:
+                                  savename: str | None=None) -> Figure | None:
     """
     Plot the number of events of one category in given lifetime ranges as a bar chart.
 
@@ -793,13 +798,18 @@ def plot_event_counts_by_lifetime(counts: list,
     ----------
     counts : list
         Event counts of the category, one per lifetime range, as given by
-        gpsp_tools.md_analysis.collision_counts_by_lifetime().
+        collision_counts_by_lifetime().
     lifetime_ranges : list of tuple
         Lifetime ranges (min_lifetime, max_lifetime) in ps.
     category : str
         Category of the counts.
     savename : str, default=None
         Path of the saved figure without the extension. If None, the figure is not saved.
+
+    Returns
+    -------
+    fig : Figure or None
+        Figure of the plot, or None if there are no data to plot.
     """
 
     title = CATEGORY_TITLES.get(category, category)
@@ -808,7 +818,7 @@ def plot_event_counts_by_lifetime(counts: list,
     filtered = [(c, r) for c, r in zip(counts, lifetime_ranges) if c > 0]
     if not filtered:
         print("No events to plot for the given lifetime ranges.")
-        return
+        return None
 
     # Counts, labels and positions of the remaining ranges
     filtered_counts, filtered_ranges = zip(*filtered)
@@ -832,7 +842,6 @@ def plot_event_counts_by_lifetime(counts: list,
 
     # Headroom above the tallest bar for the annotations
     ymax = max(filtered_counts) if filtered_counts else 1
-    # ax.set_ylim(0.8, ymax * 2.2)
     ax.set_ylim(0.8, ymax**1.1)
 
     # Annotate each bar with its count and percentage
@@ -841,22 +850,21 @@ def plot_event_counts_by_lifetime(counts: list,
         ax.text(
             bar.get_x() + bar.get_width() / 2, bar.get_height(),
             f"{count} ({percent:.1f}%)",
-            # ha='center', va='bottom', fontsize=14
-            # ha='center', va='bottom', fontsize=12
             ha='center', va='bottom', fontsize=11
         )
 
-    # Finalise the layout, save the figure if requested and show it
+    # Finalise the layout and save the figure if requested
     plt.tight_layout()
     if savename:
         fig.savefig(f"{savename}.png", dpi=200)
-    plt.show()
+
+    return fig
 
 
 def plot_all_event_counts_by_lifetime(counts_by_lifetime: dict,
                                       lifetime_ranges: list[tuple[float, float]],
                                       event_stats: dict | None=None,
-                                      savename: str | None=None) -> None:
+                                      savename: str | None=None) -> Figure:
     """
     Plot the number of events of each category in given lifetime ranges as a grouped bar chart.
 
@@ -869,14 +877,19 @@ def plot_all_event_counts_by_lifetime(counts_by_lifetime: dict,
     ----------
     counts_by_lifetime : dict
         Category mapped to the event counts in the lifetime ranges, as given by
-        gpsp_tools.md_analysis.collision_counts_by_lifetime().
+        collision_counts_by_lifetime().
     lifetime_ranges : list of tuple
         Lifetime ranges (min_lifetime, max_lifetime) in ps.
     event_stats : dict, default=None
-        Event statistics, as given by gpsp_tools.md_analysis.collision_statistics(), for the exact mean
+        Event statistics, as given by collision_statistics(), for the exact mean
         lifetimes.
     savename : str, default=None
         Path of the saved figure without the extension. If None, the figure is not saved.
+
+    Returns
+    -------
+    fig : Figure
+        Figure of the plot.
     """
 
     def histogram_mean_lifetime(counts: np.ndarray,
@@ -922,7 +935,6 @@ def plot_all_event_counts_by_lifetime(counts_by_lifetime: dict,
     width = 0.2
 
     # Grouped bars, offset for each category
-    # fig, ax = plt.subplots(figsize=(12, 6))
     fig, ax = plt.subplots(figsize=(12, 8.5))
     for i, category in enumerate(categories):
         title = CATEGORY_TITLES.get(category, category)
@@ -939,8 +951,6 @@ def plot_all_event_counts_by_lifetime(counts_by_lifetime: dict,
         if np.isnan(mean_lifetime_ps):
             legend_label = f"{title}, mean=n/a"
         else:
-            # legend_label = f"{title}, mean={mean_lifetime_ps:.1f} ps"
-            # legend_label = f"{title}, $\\tau = {mean_lifetime_ps:.1f}$ ps"
             legend_label = f"{title}, $\\langle \\tau \\rangle$ = {mean_lifetime_ps:.1f} ps"
 
         bars = ax.bar(x + i*width,
@@ -953,7 +963,6 @@ def plot_all_event_counts_by_lifetime(counts_by_lifetime: dict,
         # Annotate each non-zero bar with its count
         for bar, count in zip(bars, counts[i]):
             if count > 0:
-                # fontsize=10
                 ax.text(bar.get_x() + bar.get_width() / 2,
                         bar.get_height(),
                         f"{int(count)}",
@@ -963,10 +972,7 @@ def plot_all_event_counts_by_lifetime(counts_by_lifetime: dict,
 
     # Axis labels and the logarithmic y-axis
     ax.set_xlabel('Lifetime ranges (ps)')
-    # ax.set_ylabel('Number of events')
     ax.set_ylabel('Count')
-    # ax.set_title('Event Counts by Lifetime Ranges')
-    # ax.set_title('Event lifetimes')
     ax.set_yscale('log')
     ax.set_xticks(x + width * (len(categories) - 1) / 2)
     ax.set_xticklabels(lifetime_labels)
@@ -974,14 +980,13 @@ def plot_all_event_counts_by_lifetime(counts_by_lifetime: dict,
     # Horizontal grid lines
     ax.grid(axis='y', alpha=0.7)
 
-    # Legend, layout, saving if requested and showing the figure
-    # ax.legend()
-    # ax.legend(fontsize=16)
+    # Legend, layout and saving if requested
     ax.legend(fontsize=18)
     plt.tight_layout()
     if savename:
         fig.savefig(f"{savename}.png", dpi=200)
-    plt.show()
+
+    return fig
 
 
 def plot_bound_cluster_event(series: dict,
@@ -990,8 +995,10 @@ def plot_bound_cluster_event(series: dict,
                              event: dict | None=None,
                              r_min: float | None=None,
                              show_internal_energy: bool=True,
+                             distance_limits: tuple[float, float] | None=None,
+                             energy_unit: str='K',
                              title: str | None=None,
-                             savename: str | None=None) -> None:
+                             savename: str | None=None) -> Figure:
     """
     Plot the pair distances and binding energies of the atoms of a bound-cluster event.
 
@@ -1007,21 +1014,30 @@ def plot_bound_cluster_event(series: dict,
     Parameters
     ----------
     series : dict
-        Output of gpsp_tools.md_analysis.bound_cluster_time_series().
+        Output of bound_cluster_time_series().
     dt : float
         Time step between frames in seconds.
     collision_cutoff : float
         Cutoff distance of the collision detection in Å.
     event : dict, default=None
-        Cluster event of gpsp_tools.md_analysis.bound_cluster_events(), whose frames are shaded.
+        Cluster event of bound_cluster_events(), whose frames are shaded.
     r_min : float, default=None
         Distance of the minimum of the pair potential in Å.
     show_internal_energy : bool, default=True
         If True, plot the internal energy of the whole set of atoms.
+    distance_limits : tuple of float, default=None
+        Limits of the distance axis in Å. If None, they are set automatically.
+    energy_unit : str, default='K'
+        Unit of the energies on the axis label, that of the pair potential used in bound_cluster_time_series().
     title : str, default=None
         Title of the figure.
     savename : str, default=None
         Path of the saved figure without the extension. If None, the figure is not saved.
+
+    Returns
+    -------
+    fig : Figure
+        Figure of the plot.
     """
 
     # Time axis in ps, measured from the first frame of the event if it is given
@@ -1038,7 +1054,8 @@ def plot_bound_cluster_event(series: dict,
     if r_min is not None:
         ax_distance.axhline(r_min, color='grey', linestyle=':', alpha=0.8)
     ax_distance.set_ylabel('$R$ (Å)')
-    ax_distance.set_ylim(2, collision_cutoff + 1)
+    if distance_limits is not None:
+        ax_distance.set_ylim(distance_limits)
 
     # Energy of each atom relative to the rest and the internal energy of the whole set of atoms
     for k, atom in enumerate(series['atoms']):
@@ -1047,14 +1064,14 @@ def plot_bound_cluster_event(series: dict,
         ax_energy.plot(time_ps, series['internal_energy'], color='black', linewidth=2, label='Internal energy')
     ax_energy.axhline(0.0, color='black', linestyle=':', alpha=0.8)
     ax_energy.set_xlabel('Time from the start of the event (ps)' if event is not None else 'Time (ps)')
-    ax_energy.set_ylabel('$E$ (K)')
+    ax_energy.set_ylabel(f'$E$ ({energy_unit})')
 
     # Shade the frames in which the bound cluster exists
     if event is not None:
         for ax in (ax_distance, ax_energy):
             ax.axvspan(0.0, (event['end_frame'] - start_frame) * dt * 1e12, color='tab:red', alpha=0.08)
 
-    # Legends for at most ten pairs and atoms, title, layout, saving if requested and showing the figure
+    # Legends for at most ten pairs and atoms, title, layout and saving if requested
     if len(series['pairs']) <= 10:
         ax_distance.legend(fontsize=11, ncol=2, loc='upper right')
     if len(series['atoms']) <= 10:
@@ -1064,4 +1081,5 @@ def plot_bound_cluster_event(series: dict,
     plt.tight_layout()
     if savename:
         fig.savefig(f"{savename}.png", dpi=200)
-    plt.show()
+
+    return fig
